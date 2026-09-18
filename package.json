@@ -10,11 +10,13 @@
     "bin/",
     "dist/",
     "skills/",
+    "docs/",
     "README.md"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "test": "npm run build && node --test test/*.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "repository": {
@@ -34,7 +36,7 @@
   "author": "Shawn Pana",
   "license": "MIT",
   "engines": {
-    "node": ">=21.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "commander": "^13.1.0"

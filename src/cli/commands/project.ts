@@ -1,7 +1,10 @@
+import { PROJECT_LOOKUP } from "../validation.js";
 import { Command } from "commander";
 import { withClient } from "../../cdp/client.js";
 import { output, formatMs } from "../format.js";
-import { resolve } from "path";
+import { resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 
 const projectInfo = new Command("info")
   .description("Show project information")
@@ -11,12 +14,12 @@ const projectInfo = new Command("info")
 
     const info = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
         return {
           name: p.name, id: p.id, path: p.path,
           durationMs: Math.round(p.playbackDurationMs),
-          isDirty: p.isDirty, canUndo: p.canUndo, canRedo: p.canRedo,
+          isDirty: p.isDirty, canUndo: p.history?.canUndo, canRedo: p.history?.canRedo,
           sceneCount: p.scenes.length,
           sliceCount: p.scenes[0] ? p.scenes[0].slices.length : 0,
           zoomCount: p.scenes[0] ? p.scenes[0].zoomRanges.length : 0,
@@ -43,18 +46,12 @@ const projectOpen = new Command("open")
   .description("Open a .screenstudio project file")
   .argument("<path>", "Path to .screenstudio file")
   .action(async (filePath, _opts, cmd) => {
-    const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
     const json = cmd.parent?.parent?.opts().json || false;
     const absPath = resolve(filePath);
-
-    const result = await withClient(port, async (client) => {
-      return client.evaluate(`
-        var result = bridge.client.query('project.readProject', { projectPath: ${JSON.stringify(absPath)} });
-        return { success: true, path: ${JSON.stringify(absPath)} };
-      `);
-    });
-
-    output(result, json);
+    if (!existsSync(absPath)) throw new Error(`Project not found: ${absPath}`);
+    // readProject only reads data; macOS open delivers the app's file-open event.
+    execFileSync("open", ["-a", "Screen Studio", absPath]);
+    output({ success: true, path: absPath, message: "Requested project open" }, json);
   });
 
 const projectSave = new Command("save")
@@ -65,13 +62,14 @@ const projectSave = new Command("save")
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        var serialized = p.serialize();
-        bridge.client.mutation('project.updateProject', {
+        if (!p.rawData) throw new Error('Project saving is unavailable in this Screen Studio build.');
+        await bridge.client.mutation('project.updateProject', {
           projectPath: p.path,
-          data: serialized,
+          data: p.rawData,
         });
+        if (typeof p.markAsJustSaved === 'function') p.markAsJustSaved();
         return { success: true, path: p.path };
       `);
     });
@@ -87,11 +85,12 @@ const projectUndo = new Command("undo")
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        if (!p.canUndo) return { error: 'Nothing to undo' };
+        p.history.historyBuffer?.flush();
+        if (!p.history.canUndo) return { error: 'Nothing to undo' };
         p.history.undo();
-        return { success: true, canUndo: p.canUndo, canRedo: p.canRedo };
+        return { success: true, canUndo: p.history.canUndo, canRedo: p.history.canRedo };
       `);
     });
 
@@ -106,11 +105,12 @@ const projectRedo = new Command("redo")
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        if (!p.canRedo) return { error: 'Nothing to redo' };
+        p.history.historyBuffer?.flush();
+        if (!p.history.canRedo) return { error: 'Nothing to redo' };
         p.history.redo();
-        return { success: true, canUndo: p.canUndo, canRedo: p.canRedo };
+        return { success: true, canUndo: p.history.canUndo, canRedo: p.history.canRedo };
       `);
     });
 

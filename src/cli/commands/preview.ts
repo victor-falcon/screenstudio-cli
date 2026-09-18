@@ -1,7 +1,11 @@
 import { Command } from "commander";
-import { writeFileSync } from "fs";
+import { writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { withClient } from "../../cdp/client.js";
-import { FIND_SEEK_FN, INIT_PIXI, FORCE_RENDER } from "./seek.js";
+import { findPreviewPage } from "../../cdp/page-finder.js";
+import { FIND_SEEK_FN, SEEK_TO_TIME, INIT_PIXI, FORCE_RENDER, REFRESH_MEDIA } from "./seek.js";
+import { numberValue, PROJECT } from "../validation.js";
+import { output } from "../format.js";
 
 export const previewCommand = new Command("preview")
   .description("Screenshot the video preview canvas only")
@@ -9,145 +13,51 @@ export const previewCommand = new Command("preview")
   .option("--at <ms>", "Seek to playback time before capturing (ms, 'start', or 'end')")
   .option("--open", "Open the image after saving")
   .action(async (opts, cmd) => {
-    const port = parseInt(cmd.parent?.opts().port || "9222");
+    const global = cmd.optsWithGlobals();
+    const port = Number(global.port);
+    const timeMs = opts.at === undefined ? undefined : opts.at === "start" ? 0 :
+      opts.at === "end" ? -1 : numberValue(opts.at, "Playback time");
 
-    // If --at is specified, seek first
-    if (opts.at !== undefined) {
-      let timeMs: number;
-      if (opts.at === "start") timeMs = 0;
-      else if (opts.at === "end") timeMs = -1;
-      else timeMs = parseInt(opts.at);
+    const result = await withClient(port, async main => {
+      await main.evaluate(`${PROJECT}
+        ${timeMs === undefined ? "" : `
+          var targetMs = ${timeMs === -1 ? "p.playbackDurationMs" : timeMs};
+          if (targetMs > p.playbackDurationMs) throw new Error('Seek time extends beyond the project.');
+        `}
+        ${FIND_SEEK_FN}
+        ${timeMs === undefined ? "" : SEEK_TO_TIME}
+      `);
 
-      await withClient(port, async (client) => {
-        return client.evaluate(`
-          var p = window.$project;
-          if (!p) return { error: 'No project open' };
-          var targetMs = ${timeMs === -1 ? "Math.round(p.playbackDurationMs)" : timeMs};
-          ${FIND_SEEK_FN}
-          if (window.__clickFn) { window.__clickFn(targetMs); }
-          return { success: true };
+      const wsUrl = await findPreviewPage(port);
+      return withClient(port, async preview => {
+        await preview.evaluate(`${INIT_PIXI}
+          if (!window.__pixiComponent) throw new Error('Could not find the preview renderer in this Screen Studio build.');
+          ${FORCE_RENDER}
         `);
-      });
-    }
+        // The first render starts screen/webcam frame requests. Waiting before
+        // it can observe an empty readiness queue and capture an old frame.
+        await main.evaluate(`await window.__seekPlayback?.waitForFrameReady();`);
+        await preview.evaluate(`${INIT_PIXI} ${REFRESH_MEDIA} ${FORCE_RENDER}`);
 
-    // Find the child window (preview renderer)
-    const url = `http://localhost:${port}/json`;
-    let response: Response;
-    try {
-      response = await fetch(url);
-    } catch {
-      console.error("Cannot connect to Screen Studio. Run: screenstudio launch");
-      process.exit(1);
-    }
-
-    const pages: Array<{
-      id: string;
-      url: string;
-      webSocketDebuggerUrl: string;
-    }> = await response.json();
-
-    // Find the child window (not index.html)
-    const child = pages.find((p) => !p.url.includes("index.html"));
-    if (!child) {
-      console.error("Could not find preview window. Is a project open?");
-      process.exit(1);
-    }
-
-    const ws = new WebSocket(child.webSocketDebuggerUrl);
-
-    const result = await new Promise<string | null>((resolve) => {
-      const timeout = setTimeout(() => {
-        ws.close();
-        resolve(null);
-      }, 5000);
-
-      ws.onopen = () => {
-        // Step 1: Init pixi + force render
-        ws.send(
-          JSON.stringify({
-            id: 1,
-            method: "Runtime.evaluate",
-            params: {
-              expression: INIT_PIXI + FORCE_RENDER,
-              returnByValue: true,
-            },
-          }),
-        );
-      };
-
-      ws.onmessage = (e) => {
-        const msg = JSON.parse(
-          typeof e.data === "string" ? e.data : e.data.toString(),
-        );
-
-        if (msg.id === 1) {
-          // Step 2: Get the document root
-          ws.send(
-            JSON.stringify({ id: 2, method: "DOM.getDocument" }),
-          );
-        } else if (msg.id === 2) {
-          // Step 3: Find the canvas element
-          ws.send(
-            JSON.stringify({
-              id: 3,
-              method: "DOM.querySelector",
-              params: {
-                nodeId: msg.result.root.nodeId,
-                selector: "canvas",
-              },
-            }),
-          );
-        } else if (msg.id === 3) {
-          // Step 4: Get canvas box model for clipping
-          ws.send(
-            JSON.stringify({
-              id: 4,
-              method: "DOM.getBoxModel",
-              params: { nodeId: msg.result.nodeId },
-            }),
-          );
-        } else if (msg.id === 4) {
-          // Step 5: Screenshot just the canvas
-          const box = msg.result.model.content;
-          const x = box[0];
-          const y = box[1];
-          const width = box[2] - box[0];
-          const height = box[5] - box[1];
-
-          ws.send(
-            JSON.stringify({
-              id: 5,
-              method: "Page.captureScreenshot",
-              params: {
-                format: "png",
-                clip: { x, y, width, height, scale: 2 },
-              },
-            }),
-          );
-        } else if (msg.id === 5 && msg.result?.data) {
-          clearTimeout(timeout);
-          resolve(msg.result.data);
-          ws.close();
-        }
-      };
-
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        resolve(null);
-      };
+        const { root } = await preview.request<{ root: { nodeId: number } }>("DOM.getDocument");
+        const { nodeId } = await preview.request<{ nodeId: number }>("DOM.querySelector", {
+          nodeId: root.nodeId, selector: "canvas",
+        });
+        if (!nodeId) throw new Error("Could not find the preview canvas.");
+        const { model } = await preview.request<{ model: { content: number[] } }>("DOM.getBoxModel", { nodeId });
+        const box = model.content;
+        const x = box[0], y = box[1], width = box[2] - x, height = box[5] - y;
+        if (!(width > 0 && height > 0)) throw new Error("The preview canvas is not visible.");
+        const { data } = await preview.request<{ data: string }>("Page.captureScreenshot", {
+          format: "png", clip: { x, y, width, height, scale: 2 },
+        });
+        if (!data) throw new Error("Screen Studio did not return a preview image.");
+        return data;
+      }, wsUrl);
     });
 
-    if (!result) {
-      console.error("Could not capture preview. Is a project open?");
-      process.exit(1);
-    }
-
-    const buf = Buffer.from(result, "base64");
-    writeFileSync(opts.output, buf);
-    console.log(`Preview saved to ${opts.output}`);
-
-    if (opts.open) {
-      const { execSync } = await import("child_process");
-      execSync(`open "${opts.output}"`);
-    }
+    writeFileSync(opts.output, Buffer.from(result, "base64"));
+    if (global.json) output({ success: true, path: opts.output }, true);
+    else console.log(`Preview saved to ${opts.output}`);
+    if (opts.open) execFileSync("open", [opts.output]);
   });

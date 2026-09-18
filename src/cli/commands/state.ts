@@ -1,79 +1,54 @@
+import { PROJECT_LOOKUP } from "../validation.js";
 import { Command } from "commander";
 import { withClient } from "../../cdp/client.js";
 import { output, formatMs, table } from "../format.js";
 
-const STATE_EXPRESSION = `
-  var p = window.$project;
-  if (!p) return { error: 'No project open' };
-
-  var scene = p.scenes[0];
-  var config = p.config;
-
-  // Extract config safely (all primitives)
-  var configData = {};
-  Object.keys(config).forEach(function(k) {
-    var v = config[k];
-    var t = typeof v;
-    if (t === 'string' || t === 'number' || t === 'boolean' || v === null) configData[k] = v;
-    else if (Array.isArray(v)) configData[k] = v;
-    else if (t === 'object' && v) {
-      try { configData[k] = JSON.parse(JSON.stringify(v)); } catch(e) { configData[k] = '[object]'; }
-    }
+export const STATE_EXPRESSION = `
+  ${PROJECT_LOOKUP}
+  if (!p) throw new Error('No project open');
+  var scenes = p.scenes.map(function(scene) {
+    return {
+      id: scene.id, name: scene.name,
+      slices: scene.slices.map(function(s) {
+        return {
+          id: s.id, index: s.index,
+          sourceStartMs: Math.round(s.sourceStartMs), sourceEndMs: Math.round(s.sourceEndMs),
+          playbackStartMs: Math.round(s.playbackStartMs), playbackEndMs: Math.round(s.playbackEndMs),
+          speed: s.speed, volume: s.volume, hideCursor: s.hideCursor,
+          systemAudioVolume: s.systemAudioVolume, externalDeviceAudioVolume: s.externalDeviceAudioVolume,
+          disableSmoothMouseMovement: s.disableSmoothMouseMovement,
+        };
+      }),
+      zoomRanges: scene.zoomRanges.map(function(z) {
+        return {
+          ...z.data, sourceStartTime: z.sourceStartTime, sourceEndTime: z.sourceEndTime,
+          duration: z.duration, isAuto: z.isAuto, isManual: z.isManual,
+          manualTargetPoint: z.manualTargetPoint, hasInstantAnimation: z.hasInstantAnimation,
+        };
+      }),
+      masks: (scene.masks || []).map(function(m) { return m.data; }),
+      layouts: (scene.layouts || []).map(function(l) { return l.data; }),
+      voiceOvers: (scene.voiceOvers || []).map(function(v) { return v.data; }),
+    };
   });
-
-  // Extract slices
-  var slices = scene ? scene.slices.map(function(s) {
-    return {
-      id: s.id, index: s.index,
-      sourceStartMs: Math.round(s.sourceStartMs), sourceEndMs: Math.round(s.sourceEndMs),
-      playbackStartMs: Math.round(s.playbackStartMs), playbackEndMs: Math.round(s.playbackEndMs),
-      speed: s.speed, volume: s.volume, hideCursor: s.hideCursor,
-      systemAudioVolume: s.systemAudioVolume,
-    };
-  }) : [];
-
-  // Extract zoom ranges
-  var zooms = scene ? scene.zoomRanges.map(function(z) {
-    return {
-      id: z.id, type: z.type, zoom: typeof z.zoom === 'number' ? z.zoom : (z.zoom || null),
-      sourceStartTime: Math.round(z.sourceStartTime), sourceEndTime: Math.round(z.sourceEndTime),
-      duration: Math.round(z.duration),
-      isDisabled: z.isDisabled, isAuto: z.isAuto, isManual: z.isManual,
-      glideSpeed: z.glideSpeed,
-    };
-  }) : [];
-
-  // Recording metadata
   var rec = p.recording;
   var recording = rec ? {
-    durationMs: Math.round(rec.durationMs),
-    path: rec.recordingPath,
-    hasCamera: rec.hasCamera,
-    hasAudio: rec.hasAudio,
-    hasCursor: rec.hasCursor,
-    hasKeystrokes: rec.hasKeystrokes,
-    hasMicrophone: rec.hasMicrophone,
-    hasSystemAudio: rec.hasSystemAudio,
-    mode: rec.mode,
-    keystrokeCount: rec.keystrokes ? rec.keystrokes.length : 0,
-    mouseEventCount: rec.mouseEvents ? rec.mouseEvents.length : 0,
+    durationMs: Math.round(rec.durationMs), path: rec.recordingPath,
+    hasCamera: rec.hasCamera, hasAudio: rec.hasAudio, hasCursor: rec.hasCursor,
+    hasKeystrokes: rec.hasKeystrokes, hasMicrophone: rec.hasMicrophone,
+    hasSystemAudio: rec.hasSystemAudio, hasExternalDeviceAudio: rec.hasExternalDeviceAudio,
+    mode: rec.mode, keystrokeCount: rec.keystrokes?.length || 0,
+    mouseEventCount: rec.mouseEvents?.length || 0,
+    sessions: (rec.sessions || []).map(function(s) {
+      return { recordingStartMs: s.recordingStartMs, durationMs: s.durationMs,
+        videoPath: s.recordingVideoPath, microphonePath: s.voiceAudioPath,
+        systemAudioPath: s.systemAudioPath, externalDeviceAudioPath: s.externalDeviceAudioPath };
+    }),
   } : null;
-
   return {
-    project: {
-      name: p.name, id: p.id, path: p.path,
-      durationMs: Math.round(p.playbackDurationMs),
-      isDirty: p.isDirty, canUndo: p.canUndo, canRedo: p.canRedo,
-      hasAudio: p.hasAudio,
-    },
-    config: configData,
-    scenes: [{
-      id: scene ? scene.id : null,
-      name: scene ? scene.name : null,
-      slices: slices,
-      zoomRanges: zooms,
-    }],
-    recording: recording,
+    project: { name: p.name, id: p.id, path: p.path, durationMs: Math.round(p.playbackDurationMs),
+      isDirty: p.isDirty, canUndo: p.history?.canUndo, canRedo: p.history?.canRedo, hasAudio: p.hasAudio },
+    config: p.config, scenes: scenes, recording: recording,
   };
 `;
 
@@ -81,6 +56,8 @@ export const stateCommand = new Command("state")
   .description("Get full project state snapshot")
   .option("--slices", "Show only slices")
   .option("--zooms", "Show only zoom ranges")
+  .option("--masks", "Show masks from the first scene")
+  .option("--layouts", "Show camera layouts from the first scene")
   .option("--config", "Show only config")
   .option("--recording", "Show only recording metadata")
   .action(async (opts, cmd) => {
@@ -99,13 +76,18 @@ export const stateCommand = new Command("state")
     // Filter to requested section
     if (opts.slices) {
       const scenes = state.scenes as Array<{ slices: unknown[] }>;
-      output(scenes[0]?.slices, json);
-      if (!json) printSliceTable(scenes[0]?.slices as SliceData[]);
+      if (json) output(scenes[0]?.slices || [], true);
+      else printSliceTable((scenes[0]?.slices || []) as SliceData[]);
       return;
     }
     if (opts.zooms) {
       const scenes = state.scenes as Array<{ zoomRanges: unknown[] }>;
       output(scenes[0]?.zoomRanges, json);
+      return;
+    }
+    if (opts.masks || opts.layouts) {
+      const scenes = state.scenes as Array<Record<string, unknown>>;
+      output(scenes[0]?.[opts.masks ? "masks" : "layouts"] || [], json);
       return;
     }
     if (opts.config) {

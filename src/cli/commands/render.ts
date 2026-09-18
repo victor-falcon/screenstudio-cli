@@ -1,8 +1,10 @@
 import { Command } from "commander";
-import { execSync } from "child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "fs";
 import { withClient } from "../../cdp/client.js";
 import { output } from "../format.js";
+import { RECORDING_VIDEO } from "../recording.js";
+import { numberValue, timeRange, PROJECT_LOOKUP } from "../validation.js";
 
 interface ZoomRange {
   id: string;
@@ -29,13 +31,14 @@ export const renderCommand = new Command("render")
   .action(async (opts, cmd) => {
     const port = parseInt(cmd.parent?.opts().port || "9222");
     const json = cmd.parent?.opts().json || false;
-    const fps = parseFloat(opts.fps);
+    const fps = numberValue(opts.fps, "FPS");
+    if (fps <= 0) throw new Error("FPS must be greater than zero.");
     const outputDir = opts.output;
 
     // Check ffmpeg and ffprobe
     try {
-      execSync("which ffmpeg", { stdio: "ignore" });
-      execSync("which ffprobe", { stdio: "ignore" });
+      execFileSync("ffmpeg", ["-version"], { stdio: "ignore" });
+      execFileSync("ffprobe", ["-version"], { stdio: "ignore" });
     } catch {
       console.error(
         "ffmpeg and ffprobe are required. Install: brew install ffmpeg",
@@ -47,15 +50,18 @@ export const renderCommand = new Command("render")
     const info = await withClient(port, async (client) => {
       return client.evaluate<{
         recordingPath: string;
+        videoPath: string;
         durationMs: number;
         zooms: ZoomRange[];
         slices: SliceInfo[];
       }>(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
         var scene = p.scenes[0];
         if (!scene) return { error: 'No scene' };
+        ${RECORDING_VIDEO}
         return {
+          videoPath: videoPath,
           recordingPath: p.recording.recordingPath,
           durationMs: Math.round(p.recording.durationMs),
           zooms: scene.zoomRanges.map(function(z) {
@@ -78,24 +84,12 @@ export const renderCommand = new Command("render")
       `);
     });
 
-    // Find the video file — channel number varies per recording
-    const { readdirSync } = await import("fs");
-    const recordingFiles = readdirSync(info.recordingPath);
-    const videoFile = recordingFiles.find(
-      (f: string) => /^channel-\d+-display-\d+\.mp4$/.test(f),
-    );
-    if (!videoFile) {
-      console.error(`No video file found in: ${info.recordingPath}`);
-      process.exit(1);
-    }
-    const videoPath = `${info.recordingPath}/${videoFile}`;
+    const videoPath = info.videoPath;
 
     // Get actual video dimensions via ffprobe
-    const probeOutput = execSync(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${videoPath}"`,
-    )
-      .toString()
-      .trim();
+    const probeOutput = execFileSync("ffprobe", [
+      "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", videoPath,
+    ], { encoding: "utf8" }).trim();
     const [videoWidth, videoHeight] = probeOutput.split(",").map(Number);
 
     if (!videoWidth || !videoHeight) {
@@ -107,8 +101,9 @@ export const renderCommand = new Command("render")
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
     // Determine time range
-    const fromMs = opts.from ? parseInt(opts.from) : 0;
-    const toMs = opts.to ? parseInt(opts.to) : info.durationMs;
+    const fromMs = opts.from !== undefined ? numberValue(opts.from, "Start time") : 0;
+    const toMs = opts.to !== undefined ? numberValue(opts.to, "End time") : info.durationMs;
+    timeRange(fromMs, toMs);
 
     // Filter slices to the requested range
     const relevantSlices = info.slices.filter(
@@ -159,14 +154,14 @@ export const renderCommand = new Command("render")
       return `crop=${cropW}:${cropH}:${cropX}:${cropY}`;
     }
 
-    console.log(`Video: ${videoWidth}x${videoHeight}`);
-    console.log(`Time range: ${fromMs}ms - ${toMs}ms`);
-    console.log(`FPS: ${fps}, Output: ${outputDir}/`);
-    console.log(`Active zooms: ${activeZooms.length}`);
-    console.log();
+    if (!json) {
+      console.log(`Video: ${videoWidth}x${videoHeight}`);
+      console.log(`Time range: ${fromMs}ms - ${toMs}ms`);
+      console.log(`FPS: ${fps}, Output: ${outputDir}/`);
+      console.log(`Active zooms: ${activeZooms.length}`);
+    }
 
     let totalFrames = 0;
-    const frameIntervalMs = 1000 / fps;
 
     // Group consecutive time ranges by their active zoom to batch ffmpeg calls
     interface Segment {
@@ -218,38 +213,40 @@ export const renderCommand = new Command("render")
         ? `zoom=${seg.zoom.zoom}x`
         : "no zoom";
 
-      console.log(
+      if (!json) console.log(
         `Rendering ${segFrames} frames [${seg.startMs}ms-${seg.endMs}ms] (${zoomLabel})`,
       );
 
       const ffmpegArgs = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
         "-ss",
         String(fromSec),
         "-to",
         String(toSec),
         "-i",
-        `"${videoPath}"`,
+        videoPath,
         "-vf",
         `${cropFilter},fps=${fps}`,
         "-q:v",
         "3",
         "-start_number",
         String(startIdx),
-        `"${outputDir}/frame_%04d.jpg"`,
+        `${outputDir}/frame_%04d.jpg`,
         "-y",
       ];
 
-      try {
-        execSync(`ffmpeg ${ffmpegArgs.join(" ")} 2>/dev/null`, {
-          stdio: "ignore",
-        });
-      } catch (e) {
-        console.error(
-          `Warning: ffmpeg failed for segment ${seg.startMs}-${seg.endMs}ms`,
-        );
-      }
-
-      totalFrames += segFrames;
+      const progress = execFileSync("ffmpeg", ffmpegArgs, { encoding: "utf8" });
+      const frameCounts = [...progress.matchAll(/^frame=(\d+)\s*$/gm)];
+      const lastCount = frameCounts.at(-1);
+      if (!lastCount) throw new Error("ffmpeg did not report the number of rendered frames.");
+      // fps rounds at segment boundaries. Use the emitted count so subsequent
+      // segments continue without gaps or overwriting earlier frames.
+      totalFrames += Number(lastCount[1]);
     }
 
     const result = {
@@ -268,7 +265,7 @@ export const renderCommand = new Command("render")
     } else {
       console.log();
       console.log(
-        `Done. Rendered ~${totalFrames} frames to ${outputDir}/`,
+        `Done. Rendered ${totalFrames} frames to ${outputDir}/`,
       );
     }
   });

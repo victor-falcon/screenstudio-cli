@@ -1,6 +1,7 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { withClient } from "../../cdp/client.js";
 import { output, table } from "../format.js";
+import { numberValue, timeRange, PROJECT_LOOKUP } from "../validation.js";
 
 // Helper JS to serialize all zoom ranges as data objects
 const GET_ALL_ZOOM_DATA = `
@@ -27,7 +28,7 @@ const zoomList = new Command("list")
 
     const zooms = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
         var scene = p.scenes[0];
         if (!scene) return { error: 'No scene' };
@@ -39,6 +40,7 @@ const zoomList = new Command("list")
             duration: Math.round(z.duration),
             isDisabled: z.isDisabled, glideSpeed: z.glideSpeed,
             manualTargetPoint: z.manualTargetPoint || null,
+            hasInstantAnimation: z.hasInstantAnimation,
           };
         });
       `);
@@ -67,28 +69,31 @@ const zoomAdd = new Command("add")
   .option("--id <id>", "Custom ID for the zoom range")
   .option("--x <n>", "Target point X (0-1)")
   .option("--y <n>", "Target point Y (0-1)")
+  .option("--instant", "Use instant zoom animation")
+  .addOption(new Option("--type <type>", "Zoom mode").choices(["manual", "auto"]).default("manual"))
   .action(async (timeMs, opts, cmd) => {
     const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
     const json = cmd.parent?.parent?.opts().json || false;
-    const time = parseInt(timeMs);
-    const level = parseFloat(opts.level);
-    const endTime = opts.end ? parseInt(opts.end) : time + 3000;
+    const time = numberValue(timeMs, "Start time");
+    const level = numberValue(opts.level, "Zoom level", 1);
+    const endTime = opts.end !== undefined ? numberValue(opts.end, "End time") : time + 3000;
+    timeRange(time, endTime);
     const customId = opts.id || null;
-    const x = opts.x !== undefined ? parseFloat(opts.x) : 0.5;
-    const y = opts.y !== undefined ? parseFloat(opts.y) : 0.5;
+    const x = opts.x !== undefined ? numberValue(opts.x, "X", 0, 1) : 0.5;
+    const y = opts.y !== undefined ? numberValue(opts.y, "Y", 0, 1) : 0.5;
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        p.history.update();
         var scene = p.scenes[0];
         var allData = ${GET_ALL_ZOOM_DATA};
         var newId = ${customId ? JSON.stringify(customId) : GENERATE_ID};
+        if (allData.some(function(z) { return z.id === newId; })) throw new Error('Zoom ID already exists: ' + newId);
         var newZoom = {
           id: newId,
           zoom: ${level},
-          type: "manual",
+          type: ${JSON.stringify(opts.type)},
           snapToEdgesRatio: 0.25,
           manualTargetPoint: { x: ${x}, y: ${y} },
           glideDirection: null,
@@ -97,7 +102,7 @@ const zoomAdd = new Command("add")
           startTime: ${time},
           endTime: ${endTime},
           isSystem: false,
-          hasInstantAnimation: false,
+          hasInstantAnimation: ${!!opts.instant},
         };
         allData.push(newZoom);
         scene.update({ zoomRanges: allData });
@@ -120,13 +125,12 @@ const zoomRemove = new Command("remove")
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        p.history.update();
         var scene = p.scenes[0];
         var allData = ${GET_ALL_ZOOM_DATA};
         var filtered = allData.filter(function(d) { return d.id !== ${JSON.stringify(id)}; });
-        if (filtered.length === allData.length) return { error: 'Zoom range not found: ${id}' };
+        if (filtered.length === allData.length) throw new Error('Zoom range not found: ' + ${JSON.stringify(id)});
         scene.update({ zoomRanges: filtered });
         return { success: true, zoomCount: scene.zoomRanges.length };
       `);
@@ -146,27 +150,35 @@ const zoomUpdate = new Command("update")
   .option("--y <n>", "Target point Y (0-1)")
   .option("--disable", "Disable zoom range")
   .option("--enable", "Enable zoom range")
+  .option("--instant", "Use instant zoom animation")
+  .option("--animated", "Use smooth zoom animation")
+  .addOption(new Option("--type <type>", "Zoom mode").choices(["manual", "auto"]))
   .action(async (id, opts, cmd) => {
     const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
     const json = cmd.parent?.parent?.opts().json || false;
 
     const changes: Record<string, unknown> = {};
-    if (opts.level) changes.zoom = parseFloat(opts.level);
-    if (opts.speed) changes.glideSpeed = parseFloat(opts.speed);
-    if (opts.start) changes.startTime = parseInt(opts.start);
-    if (opts.end) changes.endTime = parseInt(opts.end);
+    if (opts.level !== undefined) changes.zoom = numberValue(opts.level, "Zoom level", 1);
+    if (opts.speed !== undefined) changes.glideSpeed = numberValue(opts.speed, "Glide speed");
+    if (opts.start !== undefined) changes.startTime = numberValue(opts.start, "Start time");
+    if (opts.end !== undefined) changes.endTime = numberValue(opts.end, "End time");
+    if (opts.disable && opts.enable) throw new Error("Choose --disable or --enable.");
+    if (opts.instant && opts.animated) throw new Error("Choose --instant or --animated.");
     if (opts.disable) changes.isDisabled = true;
     if (opts.enable) changes.isDisabled = false;
+    if (opts.instant || opts.animated) changes.hasInstantAnimation = !!opts.instant;
+    if (opts.type !== undefined) changes.type = opts.type;
 
     // Build manualTargetPoint update
     const hasX = opts.x !== undefined;
     const hasY = opts.y !== undefined;
+    const x = hasX ? numberValue(opts.x, "X", 0, 1) : undefined;
+    const y = hasY ? numberValue(opts.y, "Y", 0, 1) : undefined;
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        p.history.update();
         var scene = p.scenes[0];
         var allData = ${GET_ALL_ZOOM_DATA};
         var found = false;
@@ -179,14 +191,15 @@ const zoomUpdate = new Command("update")
             ${hasX || hasY ? `
               var current = d.manualTargetPoint || { x: 0.5, y: 0.5 };
               d.manualTargetPoint = {
-                x: ${hasX ? parseFloat(opts.x) : "current.x"},
-                y: ${hasY ? parseFloat(opts.y) : "current.y"},
+                x: ${hasX ? x : "current.x"},
+                y: ${hasY ? y : "current.y"},
               };
             ` : ""}
+            if (d.endTime <= d.startTime) throw new Error('End time must be greater than start time.');
             break;
           }
         }
-        if (!found) return { error: 'Zoom range not found: ${id}' };
+        if (!found) throw new Error('Zoom range not found: ' + ${JSON.stringify(id)});
         scene.update({ zoomRanges: allData });
         return { success: true };
       `);
@@ -202,20 +215,19 @@ const zoomSplit = new Command("split")
   .action(async (id, timeMs, _opts, cmd) => {
     const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
     const json = cmd.parent?.parent?.opts().json || false;
-    const time = parseInt(timeMs);
+    const time = numberValue(timeMs, "Split time");
 
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        p.history.update();
         var scene = p.scenes[0];
         var allData = ${GET_ALL_ZOOM_DATA};
         var idx = -1;
         for (var i = 0; i < allData.length; i++) {
           if (allData[i].id === ${JSON.stringify(id)}) { idx = i; break; }
         }
-        if (idx === -1) return { error: 'Zoom range not found: ${id}' };
+        if (idx === -1) throw new Error('Zoom range not found: ' + ${JSON.stringify(id)});
         var orig = allData[idx];
         if (${time} <= orig.startTime || ${time} >= orig.endTime) {
           return { error: 'Split time must be within the zoom range (' + Math.round(orig.startTime) + 'ms - ' + Math.round(orig.endTime) + 'ms)' };
@@ -249,11 +261,24 @@ const zoomSet = new Command("set")
       process.exit(1);
     }
 
+    if (!Array.isArray(zoomData)) throw new Error("Zoom data must be an array.");
+    const ids = new Set<string>();
+    for (const item of zoomData) {
+      if (!item || typeof item !== "object") throw new Error("Each zoom must be an object.");
+      const zoom = item as Record<string, unknown>;
+      if (typeof zoom.id !== "string" || !zoom.id || ids.has(zoom.id)) throw new Error("Each zoom needs a unique non-empty ID.");
+      ids.add(zoom.id);
+      for (const key of ["startTime", "endTime", "zoom"]) {
+        if (typeof zoom[key] !== "number") throw new Error(`Zoom ${key} must be a number.`);
+        numberValue(String(zoom[key]), key, key === "zoom" ? 1 : 0);
+      }
+      timeRange(zoom.startTime as number, zoom.endTime as number);
+      if (!["manual", "auto"].includes(String(zoom.type))) throw new Error("Zoom type must be manual or auto.");
+    }
     const result = await withClient(port, async (client) => {
       return client.evaluate(`
-        var p = window.$project;
+        ${PROJECT_LOOKUP}
         if (!p) return { error: 'No project open' };
-        p.history.update();
         var scene = p.scenes[0];
         scene.update({ zoomRanges: ${JSON.stringify(zoomData)} });
         return { success: true, zoomCount: scene.zoomRanges.length };

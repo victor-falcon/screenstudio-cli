@@ -14,6 +14,8 @@ import { seekCommand } from "./commands/seek.js";
 import { maskCommand } from "./commands/mask.js";
 import { renderCommand } from "./commands/render.js";
 import { recordCommand } from "./commands/record.js";
+import { audioCommand } from "./commands/audio.js";
+import { doctorCommand } from "./commands/doctor.js";
 
 const program = new Command("screenstudio")
   .description("Control Screen Studio from the command line")
@@ -36,6 +38,8 @@ program.addCommand(seekCommand);
 program.addCommand(maskCommand);
 program.addCommand(renderCommand);
 program.addCommand(recordCommand);
+program.addCommand(audioCommand);
+program.addCommand(doctorCommand);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(`Error: ${err.message}`);

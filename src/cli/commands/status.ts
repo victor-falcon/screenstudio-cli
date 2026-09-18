@@ -1,3 +1,4 @@
+import { PROJECT_LOOKUP } from "../validation.js";
 import { Command } from "commander";
 import { withClient } from "../../cdp/client.js";
 import { output, formatMs } from "../format.js";
@@ -23,11 +24,11 @@ export const statusCommand = new Command("status")
 
     const result = await withClient<StatusResult>(port, async (client) => {
       return client.evaluate<StatusResult>(`
-        var version = electronEnv.APP_VERSION;
-        var size = window.$projects.size;
+        var version = typeof electronEnv !== 'undefined' ? electronEnv.APP_VERSION : 'unknown';
+        var size = window.$projects?.size ?? window.$projects?.length ?? 0;
         var result = { version: version, projectCount: size };
-        if (size > 0) {
-          var p = window.$project;
+        ${PROJECT_LOOKUP}
+        if (p) {
           result.project = {
             name: p.name,
             path: p.path,

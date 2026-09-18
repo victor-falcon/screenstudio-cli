@@ -1,77 +1,51 @@
 import { Command } from "commander";
 import { withClient } from "../../cdp/client.js";
 import { output } from "../format.js";
+import { PROJECT } from "../validation.js";
+
+export function configPatchExpression(changes: Record<string, unknown>): string {
+  const serialized = JSON.stringify(changes, (_key, value) => {
+    if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Config numbers must be finite.");
+    return value;
+  });
+  return `${PROJECT}
+    var changes = JSON.parse(${JSON.stringify(serialized)});
+    for (var key of Object.keys(changes)) {
+      if (['__proto__', 'constructor', 'prototype'].includes(key) ||
+          !Object.prototype.hasOwnProperty.call(p.config, key)) {
+        throw new Error('Unknown config key: ' + key + '. Run screenstudio config --list.');
+      }
+      var current = p.config[key], next = changes[key];
+      if (current !== null && next !== null &&
+          (typeof current !== typeof next || Array.isArray(current) !== Array.isArray(next))) {
+        throw new Error('Invalid value type for config key: ' + key);
+      }
+    }
+    if (typeof p.updateConfig !== 'function') throw new Error('This Screen Studio build does not expose config editing.');
+    p.updateConfig(changes);
+    return Object.fromEntries(Object.keys(changes).map(function(key) { return [key, p.config[key]]; }));
+  `;
+}
 
 export const configCommand = new Command("config")
-  .description("Read or write Screen Studio config values")
+  .description("Read or write config keys exposed by the connected Screen Studio version")
   .argument("[key]", "Config key to read or write")
-  .argument("[value]", "Value to set")
+  .argument("[value]", "Value to set (string or JSON)")
   .option("--list", "List all config keys and values")
   .action(async (key, value, opts, cmd) => {
-    const port = parseInt(cmd.parent?.opts().port || "9222");
-    const json = cmd.parent?.opts().json || false;
-
-    if (opts.list || !key) {
-      // List all config
-      const config = await withClient(port, async (client) => {
-        return client.evaluate(`
-          var p = window.$project;
-          if (!p) return { error: 'No project open' };
-          var config = p.config;
-          var result = {};
-          Object.keys(config).forEach(function(k) {
-            var v = config[k];
-            var t = typeof v;
-            if (t === 'string' || t === 'number' || t === 'boolean' || v === null) result[k] = v;
-            else if (Array.isArray(v)) result[k] = v;
-            else if (t === 'object' && v) {
-              try { result[k] = JSON.parse(JSON.stringify(v)); } catch(e) { result[k] = '[object]'; }
-            }
-          });
-          return result;
-        `);
-      });
-      output(config, json);
-      return;
-    }
-
-    if (value !== undefined) {
-      // Write config
-      // Auto-parse the value
+    const port = Number(cmd.optsWithGlobals().port || "9222");
+    const json = cmd.optsWithGlobals().json || false;
+    const result = await withClient(port, async (client) => {
+      if (opts.list || !key) return client.evaluate(`${PROJECT} return p.config;`);
+      if (value === undefined) return client.evaluate(`${PROJECT}
+        var key = ${JSON.stringify(key)};
+        if (!Object.prototype.hasOwnProperty.call(p.config, key)) throw new Error('Unknown config key: ' + key);
+        return p.config[key];
+      `);
       let parsed: unknown = value;
-      if (value === "true") parsed = true;
-      else if (value === "false") parsed = false;
-      else if (value === "null") parsed = null;
-      else if (!isNaN(Number(value)) && value !== "") parsed = Number(value);
-      else {
-        try {
-          parsed = JSON.parse(value);
-        } catch {
-          // Keep as string
-        }
-      }
-
-      const result = await withClient(port, async (client) => {
-        return client.evaluate(`
-          var p = window.$project;
-          if (!p) return { error: 'No project open' };
-          p.history.update();
-          p.updateConfig(JSON.parse(${JSON.stringify(JSON.stringify({ [key]: parsed }))}));
-          return { key: ${JSON.stringify(key)}, value: p.config[${JSON.stringify(key)}] };
-        `);
-      });
-      output(result, json);
-    } else {
-      // Read single config value
-      const result = await withClient(port, async (client) => {
-        return client.evaluate(`
-          var p = window.$project;
-          if (!p) return { error: 'No project open' };
-          var v = p.config[${JSON.stringify(key)}];
-          if (v === undefined) return { error: 'Unknown config key: ${key}' };
-          return v;
-        `);
-      });
-      output(result, json);
-    }
+      try { parsed = JSON.parse(value); } catch { /* Keep plain strings. */ }
+      const values = await client.evaluate<Record<string, unknown>>(configPatchExpression({ [key]: parsed }));
+      return { key, value: values[key] };
+    });
+    output(result, json);
   });

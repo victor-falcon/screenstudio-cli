@@ -899,7 +899,7 @@ const recordStop = new Command("stop")
 
     await withClient(port, async (client) => {
       return client.evaluate(`
-        bridge.client.mutation("capture.finish").then(function() {}).catch(function() {});
+        await bridge.client.mutation("capture.finish");
       `);
     });
 
@@ -919,7 +919,7 @@ const recordCancel = new Command("cancel")
 
     await withClient(port, async (client) => {
       return client.evaluate(`
-        bridge.client.mutation("capture.cancel").then(function() {}).catch(function() {});
+        await bridge.client.mutation("capture.cancel");
       `);
     });
 
@@ -941,7 +941,7 @@ const recordPause = new Command("pause")
 
     await withClient(port, async (client) => {
       return client.evaluate(`
-        bridge.client.mutation("capture.pause").then(function() {}).catch(function() {});
+        await bridge.client.mutation("capture.pause");
       `);
     });
 
@@ -958,7 +958,7 @@ const recordResume = new Command("resume")
 
     await withClient(port, async (client) => {
       return client.evaluate(`
-        bridge.client.mutation("capture.resume").then(function() {}).catch(function() {});
+        await bridge.client.mutation("capture.resume");
       `);
     });
 
