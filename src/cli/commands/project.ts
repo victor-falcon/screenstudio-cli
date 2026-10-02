@@ -1,125 +1,102 @@
-import { PROJECT_LOOKUP } from "../validation.js";
 import { Command } from "commander";
-import { withClient } from "../../cdp/client.js";
-import { output, formatMs } from "../format.js";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { evaluate, globals } from "../context.js";
+import { output, formatMs } from "../format.js";
+import { appBundle } from "./launch.js";
 
 const projectInfo = new Command("info")
   .description("Show project information")
   .action(async (_opts, cmd) => {
-    const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
-    const json = cmd.parent?.parent?.opts().json || false;
+    const info = await evaluate<Record<string, unknown>>(cmd, `
+      var p = ss.project(), s = ss.scene(p);
+      ss.flush(p);
+      return {
+        name: p.name, id: p.id, path: p.path,
+        durationMs: Math.round(p.playbackDurationMs), sourceDurationMs: Math.round(p.sourceDurationMs),
+        isDirty: p.isDirty, canUndo: p.history.canUndo, canRedo: p.history.canRedo,
+        sceneCount: p.scenes.length, sliceCount: s.slices.length, zoomCount: s.zooms.length,
+        maskCount: s.masks.length, layoutCount: s.layouts.length, voiceOverCount: s.voiceOvers.length,
+        hasMicrophone: p.recording.hasMicrophone, hasCamera: p.recording.hasCamera,
+        lastSavedAt: p.lastSavedAt,
+      };
+    `);
+    if (globals(cmd).json) return output(info, true);
+    console.log(`Name: ${info.name}`);
+    console.log(`Path: ${info.path}`);
+    console.log(`Duration: ${formatMs(info.durationMs as number)} (recording: ${formatMs(info.sourceDurationMs as number)})`);
+    console.log(`Slices: ${info.sliceCount} | Zooms: ${info.zoomCount} | Masks: ${info.maskCount} | Layouts: ${info.layoutCount}`);
+    console.log(`Dirty: ${info.isDirty} | Undo: ${info.canUndo} | Redo: ${info.canRedo}`);
+    if (info.lastSavedAt) console.log(`Last Saved: ${info.lastSavedAt}`);
+  });
 
-    const info = await withClient(port, async (client) => {
-      return client.evaluate(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        return {
-          name: p.name, id: p.id, path: p.path,
-          durationMs: Math.round(p.playbackDurationMs),
-          isDirty: p.isDirty, canUndo: p.history?.canUndo, canRedo: p.history?.canRedo,
-          sceneCount: p.scenes.length,
-          sliceCount: p.scenes[0] ? p.scenes[0].slices.length : 0,
-          zoomCount: p.scenes[0] ? p.scenes[0].zoomRanges.length : 0,
-          hasAudio: p.hasAudio,
-          lastSavedAt: p.lastSavedAt,
-        };
-      `);
-    });
-
-    if (json) {
-      output(info, true);
-    } else {
-      const i = info as Record<string, unknown>;
-      console.log(`Name: ${i.name}`);
-      console.log(`Path: ${i.path}`);
-      console.log(`Duration: ${formatMs(i.durationMs as number)}`);
-      console.log(`Slices: ${i.sliceCount} | Zoom Ranges: ${i.zoomCount}`);
-      console.log(`Dirty: ${i.isDirty} | Undo: ${i.canUndo} | Redo: ${i.canRedo}`);
-      if (i.lastSavedAt) console.log(`Last Saved: ${i.lastSavedAt}`);
-    }
+const projectList = new Command("list")
+  .description("List open projects")
+  .action(async (_opts, cmd) => {
+    const projects = await evaluate<Array<Record<string, unknown>>>(cmd, `
+      var focused = window.$$focused && window.$$focused.project;
+      return ss.projects().map(function (p) {
+        return { name: p.name, path: p.path, isDirty: p.isDirty, isFocused: p === focused };
+      });
+    `);
+    if (globals(cmd).json) return output(projects, true);
+    if (!projects.length) console.log("No project open");
+    for (const p of projects) console.log(`${p.isFocused ? "* " : "  "}${p.name}  ${p.path}${p.isDirty ? " (unsaved)" : ""}`);
   });
 
 const projectOpen = new Command("open")
   .description("Open a .screenstudio project file")
   .argument("<path>", "Path to .screenstudio file")
-  .action(async (filePath, _opts, cmd) => {
-    const json = cmd.parent?.parent?.opts().json || false;
+  .option("--app <path>", "Screen Studio app bundle (default: the official app)")
+  .action(async (filePath, opts, cmd) => {
     const absPath = resolve(filePath);
     if (!existsSync(absPath)) throw new Error(`Project not found: ${absPath}`);
-    // readProject only reads data; macOS open delivers the app's file-open event.
-    execFileSync("open", ["-a", "Screen Studio", absPath]);
-    output({ success: true, path: absPath, message: "Requested project open" }, json);
+    // macOS delivers the app's file-open event, which opens the project editor.
+    const app = appBundle(opts.app ?? cmd.optsWithGlobals().app);
+    execFileSync("open", [...app.openArgs, absPath]);
+    output({ success: true, path: absPath, message: "Requested project open" }, globals(cmd).json);
   });
 
 const projectSave = new Command("save")
   .description("Save the current project")
   .action(async (_opts, cmd) => {
-    const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
-    const json = cmd.parent?.parent?.opts().json || false;
-
-    const result = await withClient(port, async (client) => {
-      return client.evaluate(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        if (!p.rawData) throw new Error('Project saving is unavailable in this Screen Studio build.');
-        await bridge.client.mutation('project.updateProject', {
-          projectPath: p.path,
-          data: p.rawData,
-        });
-        if (typeof p.markAsJustSaved === 'function') p.markAsJustSaved();
-        return { success: true, path: p.path };
-      `);
-    });
-
-    output(result, json);
+    output(await evaluate(cmd, `
+      var p = ss.project(), ed = ss.editor(p);
+      // The app's own save serializes the project and waits for the write before clearing isDirty.
+      await ss.runAction('saveProject', ed);
+      return { success: true, path: p.path, isDirty: p.isDirty };
+    `), globals(cmd).json);
   });
 
 const projectUndo = new Command("undo")
   .description("Undo the last change")
   .action(async (_opts, cmd) => {
-    const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
-    const json = cmd.parent?.parent?.opts().json || false;
-
-    const result = await withClient(port, async (client) => {
-      return client.evaluate(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        p.history.historyBuffer?.flush();
-        if (!p.history.canUndo) return { error: 'Nothing to undo' };
-        p.history.undo();
-        return { success: true, canUndo: p.history.canUndo, canRedo: p.history.canRedo };
-      `);
-    });
-
-    output(result, json);
+    output(await evaluate(cmd, `
+      var p = ss.project(), h = p.history;
+      ss.flush(p);
+      if (!h.canUndo) return { error: 'Nothing to undo' };
+      h.undo();
+      return { success: true, canUndo: h.canUndo, canRedo: h.canRedo };
+    `), globals(cmd).json);
   });
 
 const projectRedo = new Command("redo")
   .description("Redo the last undone change")
   .action(async (_opts, cmd) => {
-    const port = parseInt(cmd.parent?.parent?.opts().port || "9222");
-    const json = cmd.parent?.parent?.opts().json || false;
-
-    const result = await withClient(port, async (client) => {
-      return client.evaluate(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        p.history.historyBuffer?.flush();
-        if (!p.history.canRedo) return { error: 'Nothing to redo' };
-        p.history.redo();
-        return { success: true, canUndo: p.history.canUndo, canRedo: p.history.canRedo };
-      `);
-    });
-
-    output(result, json);
+    output(await evaluate(cmd, `
+      var p = ss.project(), h = p.history;
+      ss.flush(p);
+      if (!h.canRedo) return { error: 'Nothing to redo' };
+      h.redo();
+      return { success: true, canUndo: h.canUndo, canRedo: h.canRedo };
+    `), globals(cmd).json);
   });
 
 export const projectCommand = new Command("project")
   .description("Project operations")
   .addCommand(projectInfo)
+  .addCommand(projectList)
   .addCommand(projectOpen)
   .addCommand(projectSave)
   .addCommand(projectUndo)

@@ -17,10 +17,11 @@ test('explicit restart quits and relaunches even when the existing CDP endpoint 
   t.after(() => { childProcess.execFileSync = original; syncBuiltinESMExports(); });
 
   await runCommand('launch', ['--restart', '--port', '9333']);
+  // Builds that share the "Screen Studio" name are told apart by bundle identifier.
   assert.deepEqual(commands, [
-    ['osascript', ['-e', 'application "Screen Studio" is running']],
-    ['osascript', ['-e', 'quit app "Screen Studio"']],
-    ['open', ['-a', 'Screen Studio', '--args', '--remote-debugging-port=9333']],
+    ['osascript', ['-e', 'application id "com.timpler.screenstudio" is running']],
+    ['osascript', ['-e', 'quit app id "com.timpler.screenstudio"']],
+    ['open', ['-b', 'com.timpler.screenstudio', '--args', '--remote-debugging-port=9333']],
   ]);
   assert.equal(JSON.parse(logs.at(-1)).message, 'Screen Studio debugging connection ready');
 });

@@ -111,12 +111,6 @@ export class CDPClient {
     return value === undefined ? "undefined" : typeof value === "string" ? value : JSON.stringify(value);
   }
 
-  async dispatchKeyEvent(key: string, code: string, modifiers: number): Promise<void> {
-    for (const type of ["keyDown", "keyUp"]) {
-      await this.request("Input.dispatchKeyEvent", { type, key, code, modifiers });
-    }
-  }
-
   disconnect(): void {
     this.ws?.close();
     this.ws = null;
@@ -127,8 +121,9 @@ export async function withClient<T>(
   port: number,
   fn: (client: CDPClient) => Promise<T>,
   wsUrl?: string,
+  timeoutMs?: number,
 ): Promise<T> {
-  const client = new CDPClient(port);
+  const client = new CDPClient(port, timeoutMs);
   try {
     await client.connect(wsUrl);
     return await fn(client);

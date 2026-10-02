@@ -3,16 +3,17 @@ import { execSync } from "child_process";
 import { withClient } from "../../cdp/client.js";
 import { output, table } from "../format.js";
 
-// Find the record function from the React fiber tree and cache it
+// Find the app menu's record functions in the React fiber tree. Rebuild them on every
+// call: a cached callback can outlive the menu that created it.
 const CACHE_RECORD_FNS = `
-  if (!window.__recordFns) {
+  {
     var root = document.getElementById("root");
     var fiberKey = Object.keys(root).find(function(k) { return k.startsWith("__reactContainer"); });
     var fiber = root[fiberKey];
     var queue = [fiber];
     var visited = 0;
     var fns = {};
-    while (queue.length > 0 && visited < 3000) {
+    while (queue.length > 0 && visited < 30000) {
       var node = queue.shift();
       visited++;
       if (!node) continue;

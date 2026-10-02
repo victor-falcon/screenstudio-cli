@@ -1,10 +1,10 @@
 import { Command } from "commander";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "fs";
-import { withClient } from "../../cdp/client.js";
+import { evaluate, globals } from "../context.js";
 import { output } from "../format.js";
 import { RECORDING_VIDEO } from "../recording.js";
-import { numberValue, timeRange, PROJECT_LOOKUP } from "../validation.js";
+import { numberValue, timeRange } from "../validation.js";
 
 interface ZoomRange {
   id: string;
@@ -29,8 +29,7 @@ export const renderCommand = new Command("render")
   .option("--to <ms>", "End time in source ms")
   .option("-o, --output <dir>", "Output directory", "/tmp/screenstudio-render")
   .action(async (opts, cmd) => {
-    const port = parseInt(cmd.parent?.opts().port || "9222");
-    const json = cmd.parent?.opts().json || false;
+    const json = globals(cmd).json;
     const fps = numberValue(opts.fps, "FPS");
     if (fps <= 0) throw new Error("FPS must be greater than zero.");
     const outputDir = opts.output;
@@ -47,50 +46,42 @@ export const renderCommand = new Command("render")
     }
 
     // Get project state
-    const info = await withClient(port, async (client) => {
-      return client.evaluate<{
-        recordingPath: string;
-        videoPath: string;
-        durationMs: number;
-        zooms: ZoomRange[];
-        slices: SliceInfo[];
-      }>(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        var scene = p.scenes[0];
-        if (!scene) return { error: 'No scene' };
-        ${RECORDING_VIDEO}
-        return {
-          videoPath: videoPath,
-          recordingPath: p.recording.recordingPath,
-          durationMs: Math.round(p.recording.durationMs),
-          zooms: scene.zoomRanges.map(function(z) {
-            return {
-              id: z.id,
-              zoom: z.zoom,
-              sourceStartTime: Math.round(z.sourceStartTime),
-              sourceEndTime: Math.round(z.sourceEndTime),
-              isDisabled: z.isDisabled,
-              manualTargetPoint: z.manualTargetPoint || null,
-            };
-          }),
-          slices: scene.slices.map(function(s) {
-            return {
-              sourceStartMs: Math.round(s.sourceStartMs),
-              sourceEndMs: Math.round(s.sourceEndMs),
-            };
-          }),
-        };
-      `);
-    });
+    const info = await evaluate<{
+      recordingPath: string;
+      videoPath: string;
+      durationMs: number;
+      zooms: ZoomRange[];
+      slices: SliceInfo[];
+    }>(cmd, `
+      var p = ss.project(), scene = ss.scene(p);
+      ${RECORDING_VIDEO}
+      return {
+        videoPath: videoPath,
+        recordingPath: p.path + '/recording',
+        durationMs: Math.round(p.recording.durationMs),
+        zooms: scene.zooms.map(function (z) {
+          return {
+            id: z.id, zoom: z.zoom,
+            sourceStartTime: Math.round(z.sourceStartMs), sourceEndTime: Math.round(z.sourceEndMs),
+            // The offline crop cannot draw a Glass Loupe lens, so it skips loupe zooms.
+            isDisabled: z.isDisabled || z.isLoupe,
+            manualTargetPoint: z.manualTargetPoint || null,
+          };
+        }),
+        slices: scene.slices.map(function (s) {
+          return { sourceStartMs: Math.round(s.sourceStartMs), sourceEndMs: Math.round(s.sourceEndMs) };
+        }),
+      };
+    `);
 
     const videoPath = info.videoPath;
 
     // Get actual video dimensions via ffprobe
     const probeOutput = execFileSync("ffprobe", [
       "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", videoPath,
-    ], { encoding: "utf8" }).trim();
-    const [videoWidth, videoHeight] = probeOutput.split(",").map(Number);
+    ], { encoding: "utf8" });
+    // HLS playlists (Screen Studio 4 recordings) report the stream once per program.
+    const [videoWidth, videoHeight] = (probeOutput.split("\n").find(line => line.trim()) ?? "").split(",").map(Number);
 
     if (!videoWidth || !videoHeight) {
       console.error(`Could not determine video dimensions from: ${videoPath}`);
@@ -231,7 +222,9 @@ export const renderCommand = new Command("render")
         "-i",
         videoPath,
         "-vf",
-        `${cropFilter},fps=${fps}`,
+        // Screen Studio 4 records limited-range YUV, which the JPEG encoder rejects; converting
+        // explicitly also lets segments too short for a frame finish with zero frames.
+        `${cropFilter},fps=${fps},format=yuvj420p`,
         "-q:v",
         "3",
         "-start_number",

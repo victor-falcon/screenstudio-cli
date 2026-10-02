@@ -50,13 +50,13 @@ screenstudio record stop                    # saves and dismisses picker overlay
 ls -lt ~/Screen\ Studio\ Projects/ | head -3
 
 # Open it
-open "/path/to/project.screenstudio"
+screenstudio project open "/path/to/project.screenstudio"
 
 # Verify
 screenstudio status
 ```
 
-If multiple projects are open, `$project` always targets the active one. If the wrong project is active, close the old one or click the new one in Screen Studio's UI.
+If multiple projects are open, commands act on the focused one. Pass `--project <name or path>` to choose another, or close the old project.
 
 ## Step 4: Analyze the Recording
 
@@ -133,8 +133,10 @@ The key principle: **zoom to wherever the action is happening.** When text appea
 **Always use 2x zoom (200%).** This crops to exactly half the frame, which for a side-by-side layout means you're showing one full side of the screen. At 2x on a 4096x2304 video, the visible area is 2048x1152 — roughly one window.
 
 ```bash
-screenstudio zoom add <start> --end <end> --level 2 --x <x> --y <y> --id <name>
+screenstudio zoom add <start> --end <end> --level 2 --x <x> --y <y>
 ```
+
+Screen Studio assigns zoom IDs. `screenstudio --json zoom add ...` prints the new zoom, including its `id`, for later `zoom update`/`remove` calls.
 
 ### The Grid System
 
@@ -189,39 +191,39 @@ Create a new zoom every time the viewer's attention should move:
 
 ```bash
 # Intro text streaming in terminal — bottom, where new text appears
-screenstudio zoom add 4500 --end 9000 --level 2 --x 1 --y 1 --id z_intro
+screenstudio zoom add 4500 --end 9000 --level 2 --x 1 --y 1
 
 # Chrome shows a permission dialog — middle of browser
-screenstudio zoom add 9000 --end 10500 --level 2 --x 0 --y 0.5 --id z_dialog
+screenstudio zoom add 9000 --end 10500 --level 2 --x 0 --y 0.5
 
 # Terminal shows connection result — bottom
-screenstudio zoom add 10500 --end 15000 --level 2 --x 1 --y 1 --id z_connected
+screenstudio zoom add 10500 --end 15000 --level 2 --x 1 --y 1
 
 # Step 2 heading + tab list — terminal bottom
-screenstudio zoom add 15000 --end 19500 --level 2 --x 1 --y 1 --id z_step2
+screenstudio zoom add 15000 --end 19500 --level 2 --x 1 --y 1
 
 # X.com loading — browser top (show header/URL loading)
-screenstudio zoom add 19500 --end 21000 --level 2 --x 0 --y 0 --id z_xloading
+screenstudio zoom add 19500 --end 21000 --level 2 --x 0 --y 0
 
 # X.com notifications visible — browser middle (show the feed)
-screenstudio zoom add 21000 --end 25500 --level 2 --x 0 --y 0.5 --id z_xnotifs
+screenstudio zoom add 21000 --end 25500 --level 2 --x 0 --y 0.5
 
 # Step 3 + state processing — terminal bottom
-screenstudio zoom add 25500 --end 31500 --level 2 --x 1 --y 1 --id z_step3
+screenstudio zoom add 25500 --end 31500 --level 2 --x 1 --y 1
 
 # Eval extraction — terminal bottom (result appearing at bottom)
-screenstudio zoom add 31500 --end 34500 --level 2 --x 1 --y 1 --id z_eval
+screenstudio zoom add 31500 --end 34500 --level 2 --x 1 --y 1
 
 # Notification summary list — terminal bottom (list growing downward)
-screenstudio zoom add 34500 --end 39000 --level 2 --x 1 --y 1 --id z_summary
+screenstudio zoom add 34500 --end 39000 --level 2 --x 1 --y 1
 
 # Outro text — terminal bottom
-screenstudio zoom add 39000 --end 41000 --level 2 --x 1 --y 1 --id z_outro
+screenstudio zoom add 39000 --end 41000 --level 2 --x 1 --y 1
 ```
 
 ### Zoom Transitions
 
-Screen Studio animates between zoom positions with a glide effect. When zooms alternate between left and right sides, this creates a natural "camera pan" across the screen. The `glideSpeed` (default 0.3) controls transition speed — lower = slower/smoother.
+Screen Studio animates between zoom positions with a glide effect. When zooms alternate between left and right sides, this creates a natural "camera pan" across the screen. The project's `animations.screenMovementSpring` setting (`screenstudio config animations.screenMovementSpring`) controls how the camera moves; `--instant` on a zoom skips the animation.
 
 **Adjacent zooms** (end of one = start of next) create smooth continuous camera movement. This is ideal for the alternating terminal/browser pattern.
 

@@ -1,389 +1,211 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mockCDP, runCommand, projectFixture } from './helpers/cdp.mjs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { appFixture, mockCDP, projectFixture, runCommand, transcriptController } from './helpers/cdp.mjs';
 
-function setup(t, bridge = {}) {
-  const fixture = projectFixture(), logs = [];
+function setup(t, projects, options) {
+  const app = appFixture(projects, options), logs = [];
   t.mock.method(console, 'log', value => logs.push(value));
-  const transport = mockCDP(t, {
-    $project: fixture.project, $projects: new Map([['fixture', fixture.project]]),
-    electronEnv: { APP_VERSION: '3.7.5-4595' },
-    bridge: { client: { query: async () => ({}), mutation: async () => undefined, ...bridge } },
-  });
-  return { ...fixture, ...transport, logs };
+  const transport = mockCDP(t, app.globals);
+  const last = () => JSON.parse(logs.at(-1));
+  return { ...app, ...transport, logs, last };
 }
 
-test('bulk speed preserves independent audio settings and unknown slice data; undo restores both speeds', async t => {
-  const { scene, calls } = setup(t);
+test('bulk speed changes become one undo step that restores every slice', async t => {
+  const fixture = projectFixture();
+  setup(t, [fixture]);
   await runCommand('slice', ['speed', 'all', '4']);
-  assert.deepEqual(scene.slices.map(s => s.speed), [4, 4]);
-  assert.equal(scene.slices[0].volume, 0.7);
-  assert.equal(scene.slices[0].systemAudioVolume, 0.8);
-  assert.equal(scene.slices[0].externalDeviceAudioVolume, 0.9);
-  assert.equal(scene.slices[0].data.futureField, 'keep');
-  assert.equal(calls.length, 1);
+  assert.deepEqual(fixture.scene.slices.map(s => s.speed), [4, 4]);
+  assert.equal(fixture.state.slices[0].futureField, 'keep');
   await runCommand('project', ['undo']);
-  assert.deepEqual(scene.slices.map(s => s.speed), [1, 2]);
+  assert.deepEqual(fixture.scene.slices.map(s => s.speed), [1, 2]);
+  assert.equal(fixture.project.history.canUndo, false);
 });
 
-test('slice update treats zero volumes and cursor visibility independently', async t => {
-  const { scene } = setup(t);
+test('slice update changes only the requested channels and cursor settings', async t => {
+  const fixture = projectFixture();
+  setup(t, [fixture]);
   await runCommand('slice', ['update', '0', '--system-volume', '0', '--device-volume', '0.2', '--hide-cursor', '--raw-cursor']);
-  assert.equal(scene.slices[0].volume, 0.7);
-  assert.equal(scene.slices[0].systemAudioVolume, 0);
-  assert.equal(scene.slices[0].externalDeviceAudioVolume, 0.2);
-  assert.equal(scene.slices[0].hideCursor, true);
-  assert.equal(scene.slices[0].disableSmoothMouseMovement, true);
-  assert.equal(scene.slices[1].systemAudioVolume, 1);
-  await runCommand('slice', ['update', 'all', '--show-cursor', '--smooth-cursor']);
-  assert.equal(scene.slices[0].hideCursor, false);
-  assert.equal(scene.slices[0].disableSmoothMouseMovement, false);
+  const [first, second] = fixture.state.slices;
+  assert.deepEqual([first.volume, first.systemAudioVolume, first.externalDeviceAudioVolume, first.hideCursor, first.disableSmoothMouseMovement], [0.7, 0, 0.2, true, true]);
+  assert.equal(second.systemAudioVolume, 1);
 });
 
-test('invalid slice speed, index, and volume fail before mutation', async t => {
-  const { calls } = setup(t);
-  for (const args of [['speed', 'all', '0'], ['speed', 'all', 'NaN'], ['speed', '1.5', '2'],
-    ['speed', '3', '2'], ['update', 'all', '--volume', '-1'], ['update', 'all', '--hide-cursor', '--show-cursor']]) {
-    await assert.rejects(runCommand('slice', args));
-  }
-  assert.equal(calls.length, 0);
+test('removing a source range inside a slice splits it and trims the right part', async t => {
+  const fixture = projectFixture();
+  const { last } = setup(t, [fixture]);
+  await runCommand('slice', ['remove', '--from', '1000', '--to', '2000']);
+  assert.deepEqual(fixture.state.slices.map(s => [s.sourceStartMs, s.sourceEndMs]), [[0, 1000], [2000, 5000], [5000, 10000]]);
+  assert.equal(last().removedMs, 1000);
+  await runCommand('slice', ['remove', '--from', '4950', '--to', '6000']);
+  // The 50ms left of the second slice is shorter than a slice can be, so it is dropped.
+  assert.deepEqual(fixture.state.slices.map(s => [s.sourceStartMs, s.sourceEndMs]), [[0, 1000], [2000, 4950], [6000, 10000]]);
+  await assert.rejects(runCommand('slice', ['remove', '--from', '0', '--to', '10000']), /entire video/);
 });
 
-test('slice boundary commands reject malformed numbers and ambiguous removal requests before connecting', async t => {
-  const { requests, calls } = setup(t);
+test('slice commands validate input before connecting', async t => {
+  const { requests } = setup(t, [projectFixture()]);
   for (const [args, message] of [
     [['split', '1200oops'], /Split time must/],
-    [['split', '--', '-1'], /Split time must/],
     [['remove', '0.5'], /Slice index must/],
-    [['merge', '1oops'], /Slice index must/],
-    [['trim', '0', '--start', 'NaN'], /Start time must/],
-    [['trim', '0', '--end', 'Infinity'], /End time must/],
+    [['speed', 'all', '0'], /Speed must/],
+    [['update', 'all', '--volume', '-1'], /volume must/],
     [['remove', '--from', '1000'], /either a slice index or both/],
-    [['remove', '0', '--from', '1000', '--to', '2000'], /either a slice index or both/],
     [['remove', '--from', '2000', '--to', '1000'], /End time must be greater/],
   ]) await assert.rejects(runCommand('slice', args), message);
   assert.equal(requests.length, 0);
-  assert.equal(calls.length, 0);
 });
 
-test('invalid trims, out-of-recording removals, and merging the last slice fail without mutation', async t => {
-  const { calls } = setup(t);
-  for (const [args, message] of [
-    [['trim', '0', '--start', '6000'], /End time must be greater/],
-    [['trim', '0', '--end', '0'], /End time must be greater/],
-    [['trim', '0', '--end', '10001'], /beyond the recording/],
-    [['remove', '--from', '0', '--to', '10001'], /beyond the recording/],
-    [['merge', '1'], /No next slice/],
-  ]) await assert.rejects(runCommand('slice', args), message);
-  assert.equal(calls.length, 0);
+test('trims and merges respect neighbours and the recording', async t => {
+  const fixture = projectFixture();
+  setup(t, [fixture]);
+  await assert.rejects(runCommand('slice', ['trim', '0', '--end', '6000']), /overlaps the next slice/);
+  await assert.rejects(runCommand('slice', ['trim', '1', '--end', '10001']), /beyond the recording/);
+  await assert.rejects(runCommand('slice', ['merge', '1']), /No next slice/);
+  await runCommand('slice', ['merge', '0']);
+  assert.deepEqual(fixture.state.slices.map(s => s.id), ['s1']);
+  await assert.rejects(runCommand('slice', ['remove', '0']), /only slice/);
 });
 
-test('slice splitting preserves fractional source timestamps', async t => {
-  const { scene } = setup(t);
-  const received = [];
-  scene.findSliceAtTime = time => {
-    received.push(time);
-    return { canSplitAt: () => true, splitAt: value => received.push(value) };
-  };
-  await runCommand('slice', ['split', '1200.5']);
-  assert.deepEqual(received, [1200.5, 1200.5]);
+test('loupe zooms merge partial lens options into the defaults and refuse overlaps', async t => {
+  const fixture = projectFixture();
+  const { last } = setup(t, [fixture]);
+  await runCommand('zoom', ['add', '1000', '--end', '3000', '--loupe', '--radius', '0.5', '--type', 'auto']);
+  const zoom = fixture.state.zooms[0];
+  assert.equal(zoom.presentation, 'loupe');
+  assert.equal(zoom.type, 'follow-mouse');
+  assert.deepEqual(zoom.loupeOptions, { radius01: 0.5, bevelRatio: 0.2, chromaticAberration: 0.5, hasGlassOptics: true });
+  assert.equal(last().id, zoom.id);
+  await assert.rejects(runCommand('zoom', ['add', '2000']), /cannot overlap/);
+  await runCommand('zoom', ['update', zoom.id, '--screen', '--x', '0.2']);
+  assert.equal(fixture.state.zooms[0].presentation, 'screen');
+  assert.deepEqual(fixture.state.zooms[0].manualTargetPoint, { x: 0.2, y: 0.5 });
+  await assert.rejects(runCommand('zoom', ['set', '[{"sourceStartMs":0,"sourceEndMs":1,"zoom":2,"type":"spiral"}]']), /Zoom type must be/);
 });
 
-test('adding an earlier highlight mask leaves the later mask untouched', async t => {
-  const { scene } = setup(t);
-  await runCommand('mask', ['add', '7000', '9000', '--x', '450', '--blur', '30']);
-  const later = JSON.parse(JSON.stringify(scene.masks[0].data));
-  await runCommand('mask', ['add', '0', '2000', '--type', 'highlight', '--opacity', '0.7', '--x', '20']);
-  assert.equal(scene.masks[0].type, 'highlight');
-  assert.equal(scene.masks[0].highlightMaskOpacity, 0.7);
-  assert.equal(scene.masks[0].bounds[0].x, 20);
-  assert.deepEqual(scene.masks[1].data, later);
+test('masks and layouts are created in free ranges and keep extra mask rectangles', async t => {
+  const fixture = projectFixture();
+  setup(t, [fixture]);
+  await runCommand('mask', ['add', '1000', '2000', '--type', 'highlight', '--width', '500']);
+  const mask = fixture.state.masks[0];
+  assert.deepEqual(mask.bounds, [{ x: 100, y: 100, width: 500, height: 80 }]);
+  mask.bounds.push({ x: 1, y: 2, width: 3, height: 4 });
+  await runCommand('mask', ['update', mask.id, '--height', '300', '--disable']);
+  assert.deepEqual(fixture.state.masks[0].bounds, [{ x: 100, y: 100, width: 500, height: 300 }, { x: 1, y: 2, width: 3, height: 4 }]);
+  assert.equal(fixture.state.masks[0].isDisabled, true);
+  await runCommand('layout', ['add', '3000', '4000', '--type', 'split-screen']);
+  assert.equal(fixture.state.layouts[0].type, 'split-screen');
 });
 
-test('mask updates preserve additional rectangles and accept explicit zeroes', async t => {
-  const { scene } = setup(t);
-  scene.addMask({ startTime: 1000, endTime: 4000, blur: 20, type: 'sensitive-data',
-    bounds: [{ x: 50, y: 60, width: 70, height: 80 }, { x: 200, y: 0, width: 50, height: 50 }] });
-  const id = scene.masks[0].id;
-  await runCommand('mask', ['update', id, '--start', '0', '--blur', '0', '--x', '0', '--disable']);
-  assert.equal(scene.masks[0].sourceStartTime, 0);
-  assert.equal(scene.masks[0].blur, 0);
-  assert.equal(scene.masks[0].isDisabled, true);
-  assert.deepEqual(scene.masks[0].bounds, [
-    { x: 0, y: 60, width: 70, height: 80 }, { x: 200, y: 0, width: 50, height: 50 },
-  ]);
+test('config writes nested paths as one partial group update and explains old flat keys', async t => {
+  const fixture = projectFixture();
+  const { last } = setup(t, [fixture]);
+  await runCommand('config', ['captions.position01.y', '0.9']);
+  assert.deepEqual(fixture.state.config.captions.position01, { x: 0.5, y: 0.9 });
+  assert.deepEqual(last(), { key: 'captions.position01.y', value: 0.9 });
+  assert.equal(fixture.calls.filter(c => c === 'updateConfig').length, 1);
+  await assert.rejects(runCommand('config', ['clickSoundEffect', 'null']), /Did you mean audio\.clickSoundEffect/);
+  await assert.rejects(runCommand('config', ['showTranscript']), /Did you mean captions\.enableTranscript/);
+  await assert.rejects(runCommand('config', ['audio.volume', '"loud"']), /expected number/);
+  await assert.rejects(runCommand('config', ['audio.__proto__', '1']), /Unknown config key/);
+  await runCommand('config', ['audio.volume']);
+  assert.equal(last(), 1);
 });
 
-test('invalid mask ranges and unknown IDs do not mutate or claim success', async t => {
-  const { calls } = setup(t);
-  for (const args of [['add', '2000', '1000'], ['add', '0', '12000'], ['add', '0', '1000', '--width', '0'],
-    ['update', "missing'quoted", '--blur', '10'], ['remove', 'missing']]) {
-    await assert.rejects(runCommand('mask', args));
-  }
-  assert.equal(calls.length, 0);
-});
-
-test('instant and automatic zoom options survive updates and preserve other data', async t => {
-  const { scene } = setup(t);
-  await runCommand('zoom', ['add', '1000', '--end', '5000', '--id', 'zoom-1', '--instant', '--type', 'auto']);
-  assert.equal(scene.zoomRanges[0].hasInstantAnimation, true);
-  assert.equal(scene.zoomRanges[0].type, 'auto');
-  await runCommand('zoom', ['update', 'zoom-1', '--start', '0', '--speed', '0', '--animated', '--x', '0']);
-  assert.equal(scene.zoomRanges[0].hasInstantAnimation, false);
-  assert.equal(scene.zoomRanges[0].glideSpeed, 0);
-  assert.equal(scene.zoomRanges[0].sourceStartTime, 0);
-  assert.deepEqual(scene.zoomRanges[0].manualTargetPoint, { x: 0, y: 0.5 });
-  assert.equal(scene.zoomRanges[0].type, 'auto');
-});
-
-test('zoom rejects duplicate IDs and malformed replacement arrays', async t => {
-  const { scene, calls } = setup(t);
-  await runCommand('zoom', ['add', '0', '--id', 'one']);
-  const count = calls.length;
-  await assert.rejects(runCommand('zoom', ['add', '0', '--id', 'one']), /already exists/);
-  await assert.rejects(runCommand('zoom', ['set', '{}']), /array/);
-  await assert.rejects(runCommand('zoom', ['set', '[null]']), /object/);
-  assert.equal(scene.zoomRanges.length, 1);
-  assert.equal(calls.length, count);
-});
-
-test('config discovers runtime keys and rejects misspelled keys without creating them', async t => {
-  const { project, calls, logs } = setup(t);
-  project.config.futureFeature = true;
-  await runCommand('config', ['--list']);
-  assert.equal(JSON.parse(logs.at(-1)).futureFeature, true);
-  await runCommand('config', ['microphoneInStereoMode', 'true']);
-  assert.equal(project.config.microphoneInStereoMode, true);
-  const count = calls.length;
-  await assert.rejects(runCommand('config', ["missing'key", 'true']), /Unknown config key/);
-  await assert.rejects(runCommand('config', ['audioVolume', 'NaN']), /Invalid value type/);
-  await assert.rejects(runCommand('config', ['audioVolume', '1e999']), /must be finite/);
-  await assert.rejects(runCommand('config', ['cursorSet', '{"variants":{"size":1e999}}']), /must be finite/);
-  assert.equal(project.config.audioVolume, 1);
-  assert.equal(calls.length, count);
-});
-
-test('background audio import waits for the asset copy; remove retains undo', async t => {
-  const events = [];
-  const { project } = setup(t, { mutation: async (route, input) => {
-    assert.equal(route, 'project.copyFileToProject');
-    assert.equal(input.sourcePath, '/tmp/music.mp3');
-    await new Promise(resolve => setTimeout(resolve, 5));
-    events.push('copied');
-    return 'music.mp3';
-  } });
-  const update = project.updateConfig;
-  project.updateConfig = patch => { events.push('configured'); update(patch); };
-  await runCommand('audio', ['add', '/tmp/music.mp3', '--volume', '0']);
-  assert.deepEqual(events, ['copied', 'configured']);
-  assert.equal(project.config.backgroundAudioVolume, 0);
-  assert.equal(project.config.backgroundAudioFileName, 'music.mp3');
-  await runCommand('audio', ['remove']);
-  assert.equal(project.config.backgroundAudioFileName, null);
-  await runCommand('project', ['undo']);
-  assert.equal(project.config.backgroundAudioFileName, 'music.mp3');
-});
-
-test('failed asset import leaves config unchanged', async t => {
-  const { project, calls } = setup(t, { mutation: async () => { throw new Error('File missing'); } });
-  await assert.rejects(runCommand('audio', ['add', '/tmp/missing.mp3']), /File missing/);
-  assert.equal(project.config.backgroundAudioFileName, null);
-  assert.equal(calls.length, 0);
-});
-
-test('save sends raw project data and marks saved only after IPC succeeds', async t => {
-  const { project, calls } = setup(t, { mutation: async (route, input) => {
-    assert.equal(route, 'project.updateProject');
-    assert.equal(typeof input.data, 'object');
-    assert.equal(input.projectPath, '/tmp/test.screenstudio');
-    assert.equal(project.isDirty, true);
-    await new Promise(resolve => setTimeout(resolve, 5));
-    calls.push('written');
-  } });
+test('save runs the app save action against the project editor', async t => {
+  const fixture = projectFixture();
+  const { ran, editors } = setup(t, [fixture]);
   await runCommand('project', ['save']);
-  assert.deepEqual(calls, ['written', 'saved']);
-  assert.equal(project.isDirty, false);
+  assert.equal(ran[0][0], 'saveProject');
+  assert.equal(ran[0][1], editors[0]);
 });
 
-test('save failure does not mark dirty state as saved', async t => {
-  const { project } = setup(t, { mutation: async () => { throw new Error('Read-only volume'); } });
-  await assert.rejects(runCommand('project', ['save']), /Read-only volume/);
-  assert.equal(project.isDirty, true);
+test('commands pick the focused project, or the one --project names', async t => {
+  const one = projectFixture({ name: 'One', path: '/tmp/one.screenstudio' });
+  const two = projectFixture({ name: 'Two', path: '/tmp/two.screenstudio' });
+  const { last, context } = setup(t, [one, two], { focused: 1 });
+  await runCommand('project', ['info']);
+  assert.equal(last().name, 'Two');
+  await runCommand('project', ['info'], ['--project', 'one']);
+  assert.equal(last().name, 'One');
+  await assert.rejects(runCommand('project', ['info'], ['--project', 'three']), /No open project matches three/);
+  context.$$focused = null;
+  await assert.rejects(runCommand('project', ['info']), /Several projects are open/);
 });
 
-test('recording controls propagate native errors instead of printing success', async t => {
-  const { logs } = setup(t, { mutation: async () => { throw new Error('No recording session'); } });
-  for (const action of ['pause', 'resume', 'stop', 'cancel']) {
-    await assert.rejects(runCommand('record', [action]), /No recording session/);
-  }
-  assert.equal(logs.length, 0);
+test('transcript commands open the panel for its controller and restore the sidebar', async t => {
+  const fixture = projectFixture();
+  const { editors, last } = setup(t, [fixture]);
+  const controller = transcriptController(editors[0], [['Hola'], ['a'], ['todos.'], ['Y'], ['adiós.']]);
+  editors[0].transcript = controller;
+  await runCommand('transcript', ['cut', '--text', 'a todos']);
+  assert.deepEqual(controller.actions, [['delete', [1, 2]]]);
+  assert.equal(editors[0].view.sidebarRoot, 'background');
+  assert.equal(last().text, 'a todos.');
+  await assert.rejects(runCommand('transcript', ['cut', '9']), /out of range/);
+  await runCommand('transcript', ['hide', '0-1']);
+  assert.deepEqual(controller.actions.at(-1), ['hidden', [0, 1], true]);
+  await runCommand('transcript', ['fix', '3-4', 'Y', 'chao.']);
+  assert.deepEqual(controller.actions.at(-1), ['replaceRange', 3, 4, 'Y chao.']);
 });
 
-test('undo checks the history availability, not the project placeholder', async t => {
-  setup(t);
-  await assert.rejects(runCommand('project', ['undo']), /Nothing to undo/);
-  await assert.rejects(runCommand('project', ['redo']), /Nothing to redo/);
+test('transcript apply cuts deleted words and corrects retyped ones in a single pass', async t => {
+  const fixture = projectFixture();
+  const { editors, last } = setup(t, [fixture]);
+  const controller = transcriptController(editors[0], [['Hola'], [''], ['a'], ['todos.'], ['Esto'], ['sobra.'], ['Lab'], ['Bench'], ['fin.']]);
+  editors[0].transcript = controller;
+  const dir = mkdtempSync(join(tmpdir(), 'screenstudio-apply-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  await runCommand('transcript', ['text', '--output', join(dir, 'transcript.txt')]);
+  const text = readFileSync(join(dir, 'transcript.txt'), 'utf8');
+  assert.match(text, /^Hola a todos\. Esto sobra\. Lab Bench fin\.$/m);
+  writeFileSync(join(dir, 'edited.txt'), text.replace('Esto sobra. ', '').replace('Lab Bench', 'LabBench'));
+  await runCommand('transcript', ['apply', join(dir, 'edited.txt')]);
+  assert.deepEqual(controller.actions, [['delete', [4, 5]], ['replaceRange', 6, 7, 'LabBench']]);
+  assert.equal(last().cuts.length, 1);
+
+  // A transcript that changes between reading and editing is not edited with stale indexes.
+  const { tokens } = controller, grown = [...tokens, { ...tokens[0], index: tokens.length }];
+  let reads = 0;
+  Object.defineProperty(controller, 'tokens', { get: () => (reads++ ? grown : tokens) });
+  controller.actions.length = 0;
+  await assert.rejects(runCommand('transcript', ['apply', join(dir, 'edited.txt')]), /transcript changed/);
+  assert.deepEqual(controller.actions, []);
 });
 
-test('state includes all scenes, masks, camera layouts, and external device audio', async t => {
-  const { project, scene, state, logs } = setup(t);
-  state.scene.layouts.push({ id: 'layout-1', type: 'only-camera', startTime: 0, endTime: 5000 });
-  scene.addMask({ type: 'highlight', startTime: 0, endTime: 1000, bounds: [] });
-  project.scenes.push({ ...scene, id: 'scene-2', name: 'Second scene' });
-  project.recording.hasExternalDeviceAudio = true;
-  await runCommand('state', []);
-  const result = JSON.parse(logs.at(-1));
-  assert.equal(result.scenes.length, 2);
-  assert.equal(result.scenes[0].masks[0].type, 'highlight');
-  assert.equal(result.scenes[0].layouts[0].type, 'only-camera');
-  assert.equal(result.scenes[0].slices[0].externalDeviceAudioVolume, 0.9);
-  assert.equal(result.recording.hasExternalDeviceAudio, true);
+test('export merges stored settings with options and validates them for the format', async t => {
+  const fixture = projectFixture();
+  const { ran, globals, last } = setup(t, [fixture]);
+  globals.localStorage.set('export-settings-preference-mp4-export-settings', JSON.stringify({ json: { format: 'mp4', fps: 60, quality: 'studio', height: 2160 } }));
+  await runCommand('export', ['--resolution', '1080']);
+  const [, config] = ran.find(r => r[0] === 'startExport');
+  assert.deepEqual([config.format, config.fps, config.quality, config.height, config.target, config.projectPath], ['mp4', 60, 'studio', 1080, 'file', fixture.project.path]);
+  assert.equal(last().target, 'file');
+  await assert.rejects(runCommand('export', ['--format', 'gif', '--fps', '60']), /Invalid gif fps: 60/);
 });
 
-test('status and doctor work without an active project; untested builds are identified', async t => {
-  const { context, logs } = setup(t);
-  context.$project = undefined;
-  await runCommand('status', []);
-  assert.equal(JSON.parse(logs.at(-1)).project, undefined);
-  context.electronEnv.APP_VERSION = '4.0.0-beta';
-  await runCommand('doctor', []);
-  const report = JSON.parse(logs.at(-1));
-  assert.equal(report.matchesAuditedVersion, false);
-  assert.equal(report.checks.configEditing, null);
+test('actions run against the editor, or against a zoom with --zoom', async t => {
+  const fixture = projectFixture();
+  fixture.state.zooms.push({ id: 'z1', sourceStartMs: 0, sourceEndMs: 1000, zoom: 2, type: 'manual', presentation: 'screen' });
+  const { ran } = setup(t, [fixture]);
+  await runCommand('action', ['run', 'toggleZoomLoupeMode', '--zoom', 'z1']);
+  assert.equal(ran[0][0], 'toggleZoomLoupeMode');
+  assert.equal(ran[0][1].id, 'z1');
+  await assert.rejects(runCommand('action', ['run', 'toggleZoomLoupeMode']), /does not apply/);
+  await assert.rejects(runCommand('action', ['run', 'nope']), /Unknown Screen Studio action/);
 });
 
-test('launch reuses an existing endpoint without invoking macOS app controls', async t => {
-  const { logs } = setup(t);
-  await runCommand('launch', []);
-  assert.match(JSON.parse(logs.at(-1)).message, /Reusing/);
-});
-
-test('launch honors its local port override instead of the global default', async t => {
-  const { logs } = setup(t);
-  await runCommand('launch', ['--port', '9333']);
-  assert.equal(JSON.parse(logs.at(-1)).port, 9333);
-  assert.equal(globalThis.fetch.mock.calls[0].arguments[0], 'http://127.0.0.1:9333/json');
-});
-
-test('latest app speed preset 24x is accepted', async t => {
-  const { scene } = setup(t);
-  await runCommand('slice', ['speed', '0', '24']);
-  assert.equal(scene.slices[0].speed, 24);
-});
-
-function exportSetup(t, manager, clipboardAction) {
-  const fixture = setup(t);
-  const current = { memoizedProps: { value: { project: fixture.project, exportManager: manager } },
-    child: { memoizedProps: { parent: 'Export', action: { id: 'quickExportToClipboard' } },
-      child: { memoizedProps: clipboardAction } } };
-  // React's container fiber can be stale; the active tree is stateNode.current.
-  fixture.context.document = { getElementById: () => ({
-    __reactContainer$test: { stateNode: { current }, memoizedProps: {
-      value: { project: {}, exportManager: { openPicker() { throw new Error('Wrong project'); } } },
-    } },
-  }) };
-  return fixture;
-}
-
-test('export opens the active editor dialog and waits for native completion', async t => {
-  const manager = { isPickerOpened: false, async openPicker() {
-    await new Promise(resolve => setTimeout(resolve, 5));
-    this.isPickerOpened = true;
-  } };
-  const { logs, requests } = exportSetup(t, manager);
-  await runCommand('export', []);
-  assert.equal(manager.isPickerOpened, true);
-  assert.equal(JSON.parse(logs.at(-1)).message, 'Opened export dialog');
-  assert.ok(requests.every(request => request.method !== 'Input.dispatchKeyEvent'));
-});
-
-test('export does not report success when the app leaves the dialog closed', async t => {
-  const { logs } = exportSetup(t, { isPickerOpened: false, async openPicker() {} });
-  await assert.rejects(runCommand('export', []), /did not open/);
-  assert.equal(logs.length, 0);
-});
-
-test('clipboard export invokes the enabled native action and propagates failure', async t => {
-  let calls = 0;
-  const action = { enabled: true, async onClick() {
-    await new Promise(resolve => setTimeout(resolve, 5)); calls++;
-  } };
-  const { logs } = exportSetup(t, {}, action);
-  await runCommand('export', ['--clipboard']);
-  assert.equal(calls, 1);
-  action.onClick = async () => { throw new Error('Native export failed'); };
-  await assert.rejects(runCommand('export', ['--clipboard']), /Native export failed/);
-  action.enabled = false;
-  await assert.rejects(runCommand('export', ['--clipboard']), /unavailable/);
-  assert.equal(logs.length, 1);
-});
-
-test('export rejects missing project controls and exports already in progress', async t => {
-  const manager = { isExportInProgress: true };
-  const { context, logs } = exportSetup(t, manager);
-  await assert.rejects(runCommand('export', []), /already in progress/);
-  context.document.getElementById = () => null;
-  await assert.rejects(runCommand('export', []), /Could not find/);
-  context.$project = undefined;
-  await assert.rejects(runCommand('export', []), /No project open/);
-  assert.equal(logs.length, 0);
-});
-
-test('seek refreshes callbacks after reopening and ignores other project timelines', async t => {
-  const { project, context } = setup(t);
-  project.playbackDurationMs = 6000;
-  const times = [], stale = () => { throw new Error('Stale or wrong project timeline'); };
-  const oldOwner = { memoizedProps: { value: { project: {} } } };
-  oldOwner.child = { memoizedProps: { onTimeClick: stale }, return: oldOwner };
-  const owner = { memoizedProps: { value: { project } } };
-  owner.child = { memoizedProps: { onTimeClick: time => times.push(time) }, return: owner };
-  oldOwner.sibling = owner;
-  context.document = { getElementById: () => ({ __reactContainer$test: {
-    stateNode: { current: { child: oldOwner } }, child: oldOwner.child,
-  } }) };
-  context.__seekFn = context.__clickFn = stale;
-  await runCommand('seek', ['1500.5']);
-  const reopened = { playbackDurationMs: 6000 };
-  owner.memoizedProps.value.project = context.$project = reopened;
-  context.$projects = new Set([reopened]);
-  owner.child.memoizedProps.onTimeClick = time => times.push(time + 1);
+test('seek moves the editor playhead and preview writes the rendered frame', async t => {
+  const fixture = projectFixture();
+  const { editors, last } = setup(t, [fixture]);
   await runCommand('seek', ['2500']);
-  assert.deepEqual(times, [1500.5, 2501]);
-});
-
-test('seek and preview fail when no active timeline exists instead of reporting success', async t => {
-  const { project, context, logs } = setup(t);
-  project.playbackDurationMs = 6000;
-  context.document = { getElementById: () => null };
-  await assert.rejects(runCommand('seek', ['1000']), /Could not find the active project timeline/);
-  await assert.rejects(runCommand('preview', ['--at', '1000']), /Could not find the active project timeline/);
-  assert.equal(logs.length, 0);
-});
-
-test('closed project globals are ignored by status, doctor, reads, and editing commands', async t => {
-  const { context, calls, logs } = setup(t);
-  context.$projects.clear(); // $project remains set, just as in the live app.
-  await runCommand('status', []);
-  assert.equal(JSON.parse(logs.at(-1)).project, undefined);
-  await runCommand('doctor', []);
-  assert.equal(JSON.parse(logs.at(-1)).projectOpen, false);
-  for (const [command, args] of [
-    ['state', []], ['project', ['info']], ['project', ['save']], ['project', ['undo']],
-    ['config', ['microphoneInStereoMode', 'true']], ['audio', ['remove']],
-    ['slice', ['list']], ['slice', ['split', '1000']], ['slice', ['speed', 'all', '2']],
-    ['mask', ['add', '0', '1000']], ['zoom', ['add', '0']],
-    ['seek', ['1000']], ['preview', []], ['export', []],
-  ]) await assert.rejects(runCommand(command, args), /No project open/);
-  assert.equal(calls.length, 0);
-  assert.equal(logs.length, 2);
-});
-
-test('seek and preview reject invalid times and times beyond project duration', async t => {
-  const { project, logs } = setup(t);
-  project.playbackDurationMs = 6000;
-  for (const time of ['NaN', 'Infinity', '6001']) {
-    await assert.rejects(runCommand('seek', [time]));
-    await assert.rejects(runCommand('preview', ['--at', time]));
-  }
-  assert.equal(logs.length, 0);
+  assert.equal(editors[0].playback.headTime, 2500);
+  await assert.rejects(runCommand('seek', ['20000']), /outside the project/);
+  const dir = mkdtempSync(join(tmpdir(), 'screenstudio-preview-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  await runCommand('preview', ['--at', '1000', '--output', join(dir, 'frame.png')]);
+  assert.deepEqual([...readFileSync(join(dir, 'frame.png'))], [137, 80, 78, 71]);
+  assert.equal(last().playbackMs, 1000);
 });

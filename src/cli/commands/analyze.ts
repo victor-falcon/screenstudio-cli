@@ -1,10 +1,10 @@
 import { Command } from "commander";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "fs";
-import { withClient } from "../../cdp/client.js";
+import { evaluate, globals } from "../context.js";
 import { output } from "../format.js";
 import { RECORDING_VIDEO } from "../recording.js";
-import { numberValue, timeRange, PROJECT_LOOKUP } from "../validation.js";
+import { numberValue, timeRange } from "../validation.js";
 
 export const analyzeCommand = new Command("analyze")
   .description("Extract frames and event timeline from recording")
@@ -13,8 +13,7 @@ export const analyzeCommand = new Command("analyze")
   .option("--to <ms>", "End time in source ms")
   .option("-o, --output <dir>", "Output directory", "/tmp/screenstudio-analyze")
   .action(async (opts, cmd) => {
-    const port = parseInt(cmd.parent?.opts().port || "9222");
-    const json = cmd.parent?.opts().json || false;
+    const json = globals(cmd).json;
     const interval = numberValue(opts.interval, "Interval");
     if (interval <= 0) throw new Error("Interval must be greater than zero.");
     const outputDir = opts.output;
@@ -28,22 +27,15 @@ export const analyzeCommand = new Command("analyze")
     }
 
     // Get recording info from Screen Studio
-    const info = await withClient(port, async (client) => {
-      return client.evaluate<{
-        recordingPath: string;
-        videoPath: string;
-        durationMs: number;
-      }>(`
-        ${PROJECT_LOOKUP}
-        if (!p) return { error: 'No project open' };
-        ${RECORDING_VIDEO}
-        return {
-          videoPath: videoPath,
-          recordingPath: p.recording.recordingPath,
-          durationMs: Math.round(p.recording.durationMs),
-        };
-      `);
-    });
+    const info = await evaluate<{
+      recordingPath: string;
+      videoPath: string;
+      durationMs: number;
+    }>(cmd, `
+      var p = ss.project();
+      ${RECORDING_VIDEO}
+      return { videoPath: videoPath, recordingPath: p.path + '/recording', durationMs: Math.round(p.recording.durationMs) };
+    `);
 
     const videoPath = info.videoPath;
 

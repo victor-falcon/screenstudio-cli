@@ -29,27 +29,40 @@ async function listPages(port: number): Promise<CDPPage[]> {
     typeof p.url === "string" && typeof p.webSocketDebuggerUrl === "string");
 }
 
-export async function findRendererPage(port: number): Promise<string> {
-  const pages = await listPages(port);
-  const renderer = pages.find(
-    p => p.url.includes("app.asar/dist/index.html"),
-  );
+// Screen Studio 4 loads index.html twice: in the main window and in a hidden render
+// worker. Only the main window registers the open projects.
+const MAIN_WINDOW_CHECK = "typeof electronEnv !== 'undefined' && !electronEnv.IS_RENDER_WORKER && !!window.$projects";
 
-  if (!renderer) {
-    throw new Error(
-      "Screen Studio is running but the main window was not found.",
-    );
+async function isMainWindow(wsUrl: string, timeoutMs = 3000): Promise<boolean> {
+  const ws = new WebSocket(wsUrl);
+  try {
+    return await new Promise<boolean>(resolve => {
+      const timeout = setTimeout(() => resolve(false), timeoutMs);
+      const done = (value: boolean) => { clearTimeout(timeout); resolve(value); };
+      ws.addEventListener("error", () => done(false));
+      ws.addEventListener("close", () => done(false));
+      ws.addEventListener("open", () => ws.send(JSON.stringify({
+        id: 1, method: "Runtime.evaluate", params: { expression: MAIN_WINDOW_CHECK, returnByValue: true },
+      })));
+      ws.addEventListener("message", event => {
+        try {
+          const msg = JSON.parse(String(event.data));
+          if (msg.id === 1) done(msg.result?.result?.value === true);
+        } catch { /* Ignore unrelated protocol events. */ }
+      });
+    });
+  } finally {
+    ws.close();
   }
-
-  return renderer.webSocketDebuggerUrl;
 }
 
-export async function findPreviewPage(port: number): Promise<string> {
-  const pages = (await listPages(port)).filter(p =>
-    !p.url.includes("index.html") && !p.url.startsWith("devtools:"));
-  if (!pages.length) throw new Error("Could not find a preview window. Is a project open?");
-  if (pages.length > 1) {
-    throw new Error("Multiple auxiliary windows are open. Close other project and recording picker windows before capturing a preview.");
+export async function findRendererPage(port: number): Promise<string> {
+  const candidates = (await listPages(port)).filter(p => p.url.includes("app.asar/dist/index.html"));
+  if (!candidates.length) {
+    throw new Error("Screen Studio is running but the main window was not found.");
   }
-  return pages[0].webSocketDebuggerUrl;
+  for (const page of candidates) {
+    if (await isMainWindow(page.webSocketDebuggerUrl)) return page.webSocketDebuggerUrl;
+  }
+  throw new Error("Screen Studio is running but its main window is not ready yet.");
 }

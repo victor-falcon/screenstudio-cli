@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RECORDING_VIDEO } from '../dist/cli/recording.js';
-import { mockCDP, projectFixture, runCommand } from './helpers/cdp.mjs';
+import { appFixture, mockCDP, projectFixture, runCommand } from './helpers/cdp.mjs';
 
 test('uses session metadata for window, device, and imported video filenames', () => {
   for (const path of ['/tmp/channel-8-window-0.mp4', '/tmp/channel-2-external-device-0.mp4', "/tmp/imported 'demo'.mov"]) {
@@ -34,12 +34,13 @@ test('real ffmpeg extraction handles fractional intervals and literal special ch
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const videoPath = join(directory, "window recording 'demo' $(literal).mp4");
   execFileSync('ffmpeg', ['-f', 'lavfi', '-i', 'color=c=red:s=64x48:r=10:d=2', '-c:v', 'mpeg4', '-y', videoPath], { stdio: 'ignore' });
-  const { project, state } = projectFixture();
-  Object.assign(project.recording, { recordingPath: directory, durationMs: 2000, sessions: [{ recordingVideoPath: videoPath }] });
-  state.scene.slices = [{ id: 'one', sourceStartMs: 0, sourceEndMs: 2000, timeScale: 1, volume: 1 }];
+  const fixture = projectFixture({ path: directory.replace(/\/recording$/, '') });
+  const { project, state } = fixture;
+  Object.assign(project.recording, { durationMs: 2000, sessions: [{ recordingVideoPath: videoPath }] });
+  state.slices = [{ id: 'one', sourceStartMs: 0, sourceEndMs: 2000, timeScale: 1, volume: 1 }];
   const logs = [];
   t.mock.method(console, 'log', value => logs.push(value));
-  mockCDP(t, { $project: project });
+  mockCDP(t, appFixture([fixture]).globals);
   const analyzeDir = join(directory, "analyze 'frames' $(literal)"), renderDir = join(directory, 'render frames');
   mkdirSync(analyzeDir); mkdirSync(renderDir);
   await runCommand('analyze', ['--interval', '0.5', '--output', analyzeDir]);
@@ -53,7 +54,7 @@ test('real ffmpeg extraction handles fractional intervals and literal special ch
 
   // Zoom boundaries rarely align with the output FPS. Counting rounded-up
   // estimates produces missing frame numbers between ffmpeg invocations.
-  state.scene.zoomRanges = [{ id: 'zoom', type: 'manual', zoom: 2, startTime: 700, endTime: 1100,
+  state.zooms = [{ id: 'zoom', type: 'manual', presentation: 'screen', zoom: 2, sourceStartMs: 700, sourceEndMs: 1100,
     manualTargetPoint: { x: 0.5, y: 0.5 }, isDisabled: false }];
   const segmentedDir = join(directory, 'segmented frames');
   await runCommand('render', ['--fps', '2', '--output', segmentedDir]);

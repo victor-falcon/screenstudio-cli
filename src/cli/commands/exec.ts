@@ -1,40 +1,33 @@
 import { Command } from "commander";
 import { readFileSync } from "fs";
 import { withClient } from "../../cdp/client.js";
+import { evaluate, globals } from "../context.js";
 
 export const execCommand = new Command("exec")
-  .description("Execute arbitrary JavaScript inside Screen Studio")
+  .description("Execute arbitrary JavaScript inside Screen Studio's main window")
   .argument("[expression]", "JavaScript expression to evaluate")
   .option("-f, --file <path>", "Read script from file")
+  .option("--runtime", "Run the script as an async function body with the CLI's `ss` helpers (ss.project(), ss.editor(), ss.transcriptEditor()...); return a JSON value")
   .action(async (expression, opts, cmd) => {
-    const port = parseInt(cmd.parent?.opts().port || "9222");
-
     let script: string;
-
     if (opts.file) {
       script = readFileSync(opts.file, "utf-8");
-    } else if (expression === "-" || (!expression && !opts.file)) {
-      // Read from stdin
+    } else if (expression === "-" || !expression) {
       const chunks: Buffer[] = [];
-      for await (const chunk of process.stdin) {
-        chunks.push(chunk);
-      }
+      for await (const chunk of process.stdin) chunks.push(chunk);
       script = Buffer.concat(chunks).toString("utf-8").trim();
-    } else if (expression) {
-      script = expression;
     } else {
-      console.error("Provide an expression, --file, or pipe to stdin");
-      process.exit(1);
+      script = expression;
     }
+    if (!script) throw new Error("Provide an expression, --file, or pipe to stdin");
 
-    const result = await withClient(port, async (client) => {
-      return client.evaluateRaw(script);
-    });
-
-    // Try to pretty-print JSON, otherwise print raw
+    if (opts.runtime) {
+      console.log(JSON.stringify(await evaluate(cmd, script, 120_000), null, 2));
+      return;
+    }
+    const result = await withClient(globals(cmd).port, client => client.evaluateRaw(script));
     try {
-      const parsed = JSON.parse(result);
-      console.log(JSON.stringify(parsed, null, 2));
+      console.log(JSON.stringify(JSON.parse(result), null, 2));
     } catch {
       console.log(result);
     }

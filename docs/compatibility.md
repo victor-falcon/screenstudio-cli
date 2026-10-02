@@ -1,73 +1,71 @@
 # Screen Studio compatibility
 
-Audited on **2026-09-16** against the installed macOS app **3.7.5-4595**, the latest stable release listed in the [official changelog](https://screen.studio/changelog) on that date. The releases after 3.6 chiefly fix audio, export, recording, and captions behavior; they do not establish a public automation API.
+Audited on **2026-10-02** against the installed macOS app **4.0.1-4897** (Electron 43). Screen Studio 4 rewrote the internals this CLI drives, so this version of the CLI does not support 3.x; for Screen Studio 3.7.5, use [rorz/screenstudio-cli](https://github.com/rorz/screenstudio-cli), audited against that build.
 
-This CLI uses private renderer models and IPC. The audit checked their shapes in the installed app, added regression tests, and exercised editing, saving, preview, and native file export in the running app using a disposable six-second video project. The validation details below distinguish live checks from features that remain untested. Run `screenstudio doctor` with a project open to inspect your actual runtime; its capability checks alone do not prove that every workflow works.
+This CLI uses private renderer models, the app's command-menu actions, and IPC. Live checks used disposable copies of real projects (a 13-minute, 29-slice recording with camera, microphone and a verbatim ElevenLabs transcript, and a 3-second recording). Run `screenstudio doctor` with a project open to inspect your runtime; its capability checks alone do not prove that every workflow works.
+
+## What changed in Screen Studio 4
+
+| 3.7 | 4.0 | CLI |
+| --- | --- | --- |
+| `window.$project` (active project) | Removed. `window.$projects` (MobX set) and `window.$$focused` (focused editor) | Picks the focused project, the only open one, or `--project` |
+| One renderer page with `index.html` | Main window plus a hidden render worker, both `index.html`; editor windows are `about:blank` children of the main window | Connects to the page that registers `$projects` |
+| `scene.zoomRanges`, `scene.update({ zoomRanges })`, `addMask`/`updateMask` | One collection API for slices, zooms, masks, layouts and voiceovers (`add`, `get`, `splitAt`, `findAt`, `remove`, `removeAll`); items cannot overlap | All timeline commands use the collections |
+| Flat config (~70 keys) | Grouped config: `crop`, `cursor`, `captions`, `audio`, `camera`, `animations`, `processing`, `zooms`, `defaultLayout`, `styles`, `device`, `output`. `p.config` holds circular references; read `projectConfig.serialize()`, write `updateConfig({ group: partial })` | `config group.key[.subkey]`; old flat keys fail with the new path as a hint |
+| Zoom types `manual`/`auto` | `manual`, `follow-mouse` (auto), `follow-click-groups`; `presentation: screen \| loupe` and `loupeOptions` (Glass Loupe) | `zoom --type`, `--loupe`, `--radius`, `--bevel`, `--aberration`, `--no-glass`; `auto` stays an alias |
+| Save with `rawData` | `serialize()` + `project.updateProject` + `markAsJustSaved(editGeneration)` | Runs the app's `saveProject` action |
+| Pixi preview canvas | New GPU render engine; `editor.animation.exportImage({ heightPx })` returns a PNG of the frame | `preview` uses `exportImage`; `seek` uses `playback.goTo` |
+| Export dialog only | `editor.exportManager.startExport(config)` | `export` with format/FPS/resolution/quality/codec; `--output` without a dialog |
+| Captions only | **Edit by transcript**: cut words from the video, hide them from captions, restore, correct text, remove fillers, tighten pauses | `transcript` commands |
 
 ## Feature coverage
 
 | Feature | CLI coverage |
 | --- | --- |
-| Apply playback speed to all slices | `slice speed all 2`; includes 24x speed |
-| Independent microphone, system, and external-device audio volumes | `slice update <index-or-all> --volume 1 --system-volume 0.5 --device-volume 0` |
-| Cursor visibility and smoothing per slice | `slice update <index-or-all> --hide-cursor` / `--show-cursor`, `--raw-cursor` / `--smooth-cursor` |
-| Microphone enhancement and stereo | `config improveMicrophoneAudio true`, `config microphoneInStereoMode true` |
-| Channel muting | `config muteMicrophone`, `muteSystemAudio`, `muteExternalDeviceAudio`, or `muteBackgroundAudio` with a boolean value |
-| Background music and built-in music library | `audio library`, `audio add <path> [--volume 0.1]`, `audio remove`, `audio info` |
-| Click sounds and effects | Existing `config clickSoundEffect`, `clickSoundEffectVolume`, and `clickEffect` values exposed by the app |
-| Sensitive-data and highlight masks | `mask add --type sensitive-data` or `--type highlight --opacity 0.5`; `mask update --disable` / `--enable` |
-| Instant and automatic zooms | `zoom add --instant --type auto`, `zoom update --instant` / `--animated` |
-| Current wallpapers, cursor sets, device frames, camera defaults | Runtime `config --list`; the CLI does not hard-code a fixed settings count or asset catalog. Use the app to select an asset, then read its actual config value. |
-| Camera layout timeline | Inspect with `state --layouts`; dedicated layout editing remains in the app |
-| Captions | Visibility and size via `config showTranscript` and `transcriptSizeRatio`; generation, Apple Speech Recognition selection, transcript editing, and SRT export remain in the app |
-| Keyboard shortcut overlays | `config showShortcuts`, `showShortcutsWithSingleLetters`, `shortcutsSizeRatio`, and `hiddenShortcuts` |
-| Recording pause/resume | `record pause` and `record resume` await native completion and report failures |
-| Recording input selection | Display/window/area picker automation; iPhone/iPad input and camera/microphone device setup remain in the app |
-| Frame inspection | `preview` uses the native renderer. `render`/`analyze` use the actual video path from session metadata, including window/device/imported videos. |
-| Export | `export` opens the app's dialog; `export --clipboard` triggers quick export. File format, GIF loops, resolution, shareable links, privacy, comments, and view counts remain in the app/dashboard. |
-| Reset all trims/cuts | Use the app's command menu; no CLI reset command |
+| Edit by transcript | `transcript cut/restore/hide/unhide/fix` by token range or `--text`; `transcript text` + `apply` / `edit` to edit the video as a text file |
+| Filler words and pauses | `transcript fillers [--remove] [--language es]`, `transcript pauses [--tighten]` |
+| Transcript generation | `transcript generate --engine whisper\|system\|elevenlabs` with `--language`, `--model`, `--prompt`, `--locale`, `--keyterms`, `--verbatim` |
+| SRT export | `transcript srt <path>`, with the video's cuts applied and hidden words removed, like the app's export |
+| Glass Loupe zooms | `zoom add/update --loupe` and lens options; `action run toggleZoomLoupeMode --zoom <id>` |
+| Camera layouts | `layout list/add/update/remove/clear` |
+| Masks | `mask list/add/update/remove/clear` |
+| Slices | `slice list/split/remove/speed/update/merge/trim` |
+| Config | `config --list`, `--flat`, read and write by path |
+| Background music | `audio library/add/remove/info` |
+| Frame rendering | `preview` (native renderer), `render`/`analyze` (ffmpeg, offline) |
+| Export | `export` (dialog for the path), `--output <path>`, `--clipboard`, `--wait`, `--picker` |
+| Every command-menu action | `action list`, `action run <id> [--zoom/--mask/--slice/--layout <id>]` |
+| Recording | `record start/pause/resume/stop/cancel`, display and window pickers |
 
-## Behavioral fixes
+## Behavioral notes
 
-- Project save sends an object (`rawData`), waits for the write, and marks saved only after success. Project open uses the macOS file-open event; reading a project file over IPC does not open its editor.
-- Mask creation uses the model returned by `addMask`. The mask collection is sorted, so its last entry need not be the newly created mask. Updating geometry preserves extra rectangles.
-- Model updates participate in the app's undo history. A no-argument `history.update()` is not an undo snapshot in this build. Undo/redo consult the history object and flush pending history before checking availability.
-- CDP awaits promises and reports protocol errors, renderer exceptions, disconnections, and timeouts. Recording commands no longer discard native promise rejections.
-- `launch` reuses an existing connection. Restarting a running app requires `launch --restart`; a global `--port` is honored.
-- Unknown config keys fail instead of silently adding ineffective properties. Settings are discovered from the running version.
-- Export opens the active editor's native export picker and checks that it opened. Sending keyboard events to the hidden main renderer did not trigger export in the live app. Clipboard export uses the native menu action.
-- Seeking resolves the current project's timeline on every call. Cached callbacks continued to target a closed editor after reopening a project, producing screenshots at the wrong time. Missing timelines and invalid seek times now fail explicitly.
-- Screen Studio retains its last project global after closing the editor. The CLI checks the open-project registry so diagnostics, reads, and edits do not treat that closed project as active.
-- Slice edits reject malformed numbers, reversed ranges, and ambiguous removal arguments before mutation. Config writes reject non-finite numbers before JSON serialization can turn them into null.
-- Offline rendering numbers frames using ffmpeg's actual output count. Fractional slice and zoom boundaries no longer leave gaps between segments or inflate the reported total.
-- Preview capture uses the shared CDP error and timeout handling. It reports failed captures without writing an image, supports JSON output, and opens image paths without shell interpolation.
-
-## Limits
-
-Editing commands target the **first scene**; full `state --json` includes all scenes. Offline `render`/`analyze` require a single recording session. They reject paused/resumed recordings with multiple media files instead of treating the first file as the full recording; use `preview` for those projects. `render` is an approximate static crop preview, without native automatic cursor following, spring animation, masks, camera composition, or captions.
-
-Recording picker automation, seeking, export controls, and native canvas preview still depend on React/Pixi internals. `export` confirms that its dialog opened; `export --clipboard` reports that its native action was invoked. Neither command waits for a completed file. Raw `exec`, recording cancellation, file operations, and export are not covered by project undo.
-
-Native preview requires one auxiliary app window. Close other project and recording picker windows before capture; the CLI rejects ambiguous targets rather than capturing an arbitrary window. Seeking still moves the active project's playhead when this prevents its optional preview refresh.
-
-## Beta
-
-The [official roadmap](https://screen.studio/roadmap) lists a new render engine, expanded camera tools, Glass Loupe zoom, revised captions/shortcuts/click effects, AI voice cleanup, and Unsplash backgrounds as beta features. They are outside the stable 3.7.5 audit. Do not assume stable renderer hooks or config keys work in that beta; `doctor` explicitly identifies a different build.
+- **Transcript controller.** The "Edit by transcript" controller exists while its sidebar panel is mounted. Transcript commands open the panel, take the controller from the React tree, and restore the sidebar root, item, and visibility the user had. Edits use the controller's own methods (`deleteTokens`, `restoreTarget`, `setCoveredWordsHidden`, `applyWordRangeReplacement`, `replaceCoveredWordsWithText`, `removeAllFillerWords`, `tightenAllPauses`), so cuts get the app's padding around kept words, remove zooms/layouts/masks left without footage, and refuse to remove the whole video.
+- **Stale indexes.** Commands that take token indexes read the transcript first and refuse to edit if its token count changed before the edit (another edit in the app, a regenerated transcript).
+- **Text corrections are saved by the app.** After a correction the app writes the transcript file (`captions.updateTranscript`) 800ms later. Keep Screen Studio running for that long.
+- **`transcript apply` semantics.** Words deleted with nothing typed in their place are cut. Where words were deleted and others typed, the typed words replace the deleted words they resemble most (letters and digits, similarity ≥ 0.7: typos, merged or split words, punctuation) and the rest are cut; if they resemble none, the whole stretch is a caption rewrite and nothing is cut. Use `--dry-run` to review, `--cuts-only` to ignore corrections.
+- **Filler words.** Screen Studio picks its filler list from the transcript's locale. ElevenLabs transcripts have none, so the app uses its English list (*um*, *uh*...) even for Spanish speech. `--language` uses the CLI's lists. The Spanish list leaves out *este*, which Screen Studio counts as a filler but is usually the demonstrative ("este modelo").
+- **Export output path.** With a file target, Screen Studio always asks for the path in a native save dialog and does not report the chosen path. `--output` uses the clipboard target, which needs no dialog, finds the new file in Screen Studio's clipboard exports folder (`$TMPDIR/Screen Studio/Clipboard Exports`) and copies it to the path. That also copies the video to the clipboard.
+- **Undo.** Edits within 100ms form one undo step, so each command is one step. `project info`, `undo` and `redo` flush the buffer first.
+- **Projects and editors.** With several projects open, commands use the focused editor's project unless `--project` names one (path, file name, or project name). Commands that need an editor (seek, preview, export, transcript, actions, save) fail if the project's editor window is closed.
+- **App bundle.** `launch` and `project open` address Screen Studio by bundle identifier (`com.timpler.screenstudio`), so other builds named "Screen Studio" are not picked by mistake. Use `--app <path>` or `SCREENSTUDIO_APP` for those.
+- **Recordings are HLS.** Screen Studio 4 records each channel as an HLS playlist (`.m3u8` + fMP4 segments) in limited-range YUV. `render` converts frames to full range before JPEG encoding.
 
 ## Validation
 
-Run `npm test`. Tests cover asynchronous CDP/IPC failures, current model data shapes, mask ordering, independent audio channels, undo, state inspection, export dispatch, seeking after a project switch, and real ffmpeg extraction when ffmpeg/ffprobe are installed. These tests do not start or restart Screen Studio. They use a small contract fixture, not a full emulation of the app.
+Run `npm test`. Tests cover CDP/IPC failures, main-window discovery with a render worker, project and editor selection, timeline collections (splits, range removal, overlap refusal, undo grouping), loupe options, grouped config paths, the transcript controller lookup and sidebar restore, transcript cuts and corrections, the text-edit planner and its word diff, export settings, actions with targets, seek and preview, and real ffmpeg extraction when ffmpeg is installed. They use a small contract fixture of the 4.0 models, not an emulation of the app.
 
-Review on **2026-09-18** added regression coverage for slice input validation, explicit restart dispatch, preview capture ordering and failures, ambiguous preview targets, and actual ffmpeg frame counts across zoom boundaries. These follow-up changes were checked with the automated suite; the live checks below describe the earlier audit.
+Live checks on **2026-10-02**, using **4.0.1-4897**:
 
-Live checks on **2026-09-16**, using **3.7.5-4595**:
+- `doctor` reported every capability available with the long project open; 199 actions.
+- Cut a sentence by `--text` (2.46s removed, matching the app's padding), undid it; restored a sentence the user had cut; hid and unhid words; corrected a word and confirmed the corrected transcript on disk.
+- Exported the transcript as text, deleted a sentence and a paragraph and merged two words, applied it (2 cuts, 15.9s, and 1 correction), and undid it all with one `project undo`.
+- Removed 14 Spanish filler words with `--language es` (2.8s) and undid it.
+- Exported captions as SRT.
+- Added a Glass Loupe zoom with a custom radius, changed it to a follow-mouse screen zoom, split it, toggled loupe mode through `action run --zoom`; added and edited masks and camera layouts; split, trimmed, sped up, merged and removed slices; changed nested config; undid everything (18 steps).
+- Saved through the app's action and confirmed the change on disk.
+- Seeked by playback and by source time; rendered 1280×720 PNG frames with `preview`.
+- Exported the 3-second project with `--output` at 720p/30fps/web-low and verified a 1280×720, 30fps H.264 + AAC MP4 of 3.35s with ffprobe.
+- Ran `analyze` and `render` against an HLS recording.
+- Worked with two projects open, with and without `--project`.
 
-- All `doctor` capability checks passed with the test project open; the runtime exposed 70 config keys.
-- Split a clip, applied 24x speed to all slices, changed independent audio volumes and cursor settings, and verified undo/redo.
-- Created sensitive-data and highlight masks in reverse time order, changed geometry and visibility, and inspected native previews. Created an instant automatic zoom and changed it to an animated manual zoom.
-- Read the built-in music library, imported a track, changed its volume, detached it, and restored it with undo.
-- Saved the project, checked the JSON on disk, and closed/reopened it to verify persistence. Verified seeking and capture after reopening.
-- Extracted four frames with each of `analyze` and `render` over a two-second interval.
-- Opened the export dialog through the CLI, completed the native Save dialog, and verified a six-second H.264/AAC MP4 at 3472 × 2160 and 60 fps using ffprobe.
-- Verified that `export --clipboard` reaches the native clipboard export action with an MP4 configuration. The final export call was intercepted during this check, preserving the existing clipboard; actual clipboard output was not tested.
-- Confirmed that `record pause` reports the native error when no recording is active. Active recording start/pause/resume/stop, physical device/camera inputs, captions generation, and beta features were not exercised.
+Not exercised live: transcript generation (it replaces the transcript; ElevenLabs uploads the audio), `pauses --tighten` and the app's own `fillers --remove` (the test project had nothing to tighten or remove), `export` with the save dialog and `--wait`, and recording (`record` still uses the 3.7 approach: the menu's record handlers, which the 4.0 menu still exposes, and the `capture.*` IPC routes, which still exist).

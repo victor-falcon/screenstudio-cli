@@ -1,7 +1,7 @@
 {
   "name": "screenstudio-cli",
-  "version": "0.1.0",
-  "description": "CLI tool to control Screen Studio via Chrome DevTools Protocol",
+  "version": "0.2.0",
+  "description": "CLI tool to control Screen Studio 4 via Chrome DevTools Protocol, including editing videos by their transcript",
   "type": "module",
   "bin": {
     "screenstudio": "./bin/screenstudio.js"
@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ShawnPana/screenstudio-cli.git"
+    "url": "https://github.com/victor-falcon/screenstudio-cli.git"
   },
   "keywords": [
     "screen-studio",
@@ -31,7 +31,8 @@
     "screen-recording",
     "cdp",
     "chrome-devtools-protocol",
-    "automation"
+    "automation",
+    "transcript"
   ],
   "author": "Shawn Pana",
   "license": "MIT",
